@@ -331,7 +331,7 @@ public class YarnConfiguration extends Configuration {
     RM_PREFIX + "scheduler.class";
  
   public static final String DEFAULT_RM_SCHEDULER = 
-      "org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler";
+      "org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler";
 
   /** RM set next Heartbeat interval for NM */
   public static final String RM_NM_HEARTBEAT_INTERVAL_MS =
@@ -775,7 +775,7 @@ public class YarnConfiguration extends Configuration {
   /** Specifies whether physical memory check is enabled. */
   public static final String NM_VMEM_CHECK_ENABLED = NM_PREFIX
       + "vmem-check-enabled";
-  public static final boolean DEFAULT_NM_VMEM_CHECK_ENABLED = true;
+  public static final boolean DEFAULT_NM_VMEM_CHECK_ENABLED = false;
 
   /** Conversion ratio for physical memory to virtual memory. */
   public static final String NM_VMEM_PMEM_RATIO =
@@ -817,9 +817,23 @@ public class YarnConfiguration extends Configuration {
   public static final String NM_CONTAINER_MON_PROCESS_TREE =
     NM_PREFIX + "container-monitor.process-tree.class";
   public static final String PROCFS_USE_SMAPS_BASED_RSS_ENABLED = NM_PREFIX +
-      ".container-monitor.procfs-tree.smaps-based-rss.enabled";
+      "container-monitor.procfs-tree.smaps-based-rss.enabled";
   public static final boolean DEFAULT_PROCFS_USE_SMAPS_BASED_RSS_ENABLED =
       false;
+
+  /** Enable/disable container metrics. */
+  @Private
+  public static final String NM_CONTAINER_METRICS_ENABLE =
+      NM_PREFIX + "container-metrics.enable";
+  @Private
+  public static final boolean DEFAULT_NM_CONTAINER_METRICS_ENABLE = true;
+
+  /** Container metrics flush period. -1 for flush on completion. */
+  @Private
+  public static final String NM_CONTAINER_METRICS_PERIOD_MS =
+      NM_PREFIX + "container-metrics.period-ms";
+  @Private
+  public static final int DEFAULT_NM_CONTAINER_METRICS_PERIOD_MS = -1;
   
   /** Prefix for all node manager disk health checker configs. */
   private static final String NM_DISK_HEALTH_CHECK_PREFIX =
@@ -1198,6 +1212,14 @@ public class YarnConfiguration extends Configuration {
 
   public static final String YARN_APP_CONTAINER_LOG_BACKUPS =
       YARN_PREFIX + "app.container.log.backups";
+
+  /** Directory for fail flag files */
+  @Private
+  public static final String YARN_AM_FAILURE_FLAG_DIR =
+          YARN_PREFIX + "am-failure.flag.dir";
+  @Private
+  public static final String DEFAULT_YARN_AM_FAILURE_FLAG_DIR =
+          "/tmp/hadoop-yarn/fail";
 
   ////////////////////////////////
   // Timeline Service Configs

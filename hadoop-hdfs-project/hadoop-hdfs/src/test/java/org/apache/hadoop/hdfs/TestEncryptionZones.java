@@ -38,11 +38,13 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 
 import com.google.common.collect.Lists;
+
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CipherSuite;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
 import org.apache.hadoop.crypto.key.JavaKeyStoreProvider;
 import org.apache.hadoop.crypto.key.KeyProvider;
+import org.apache.hadoop.crypto.key.KeyProviderCryptoExtension;
 import org.apache.hadoop.crypto.key.KeyProviderFactory;
 import org.apache.hadoop.fs.CommonConfigurationKeysPublic;
 import org.apache.hadoop.fs.CreateFlag;
@@ -96,7 +98,6 @@ import static org.mockito.Matchers.anyShort;
 import static org.mockito.Mockito.withSettings;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyString;
-
 import static org.apache.hadoop.hdfs.DFSTestUtil.verifyFilesEqual;
 import static org.apache.hadoop.test.GenericTestUtils.assertExceptionContains;
 import static org.junit.Assert.assertEquals;
@@ -105,6 +106,7 @@ import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+
 import org.xml.sax.InputSource;
 import org.xml.sax.helpers.DefaultHandler;
 
@@ -117,10 +119,10 @@ public class TestEncryptionZones {
   private FileSystemTestHelper fsHelper;
 
   private MiniDFSCluster cluster;
-  private HdfsAdmin dfsAdmin;
+  protected HdfsAdmin dfsAdmin;
   protected DistributedFileSystem fs;
   private File testRootDir;
-  private final String TEST_KEY = "testKey";
+  protected final String TEST_KEY = "test_key";
 
   protected FileSystemTestWrapper fsWrapper;
   protected FileContextTestWrapper fcWrapper;
@@ -157,8 +159,8 @@ public class TestEncryptionZones {
   protected void setProvider() {
     // Need to set the client's KeyProvider to the NN's for JKS,
     // else the updates do not get flushed properly
-    fs.getClient().provider = cluster.getNameNode().getNamesystem()
-        .getProvider();
+    fs.getClient().setKeyProvider(cluster.getNameNode().getNamesystem()
+        .getProvider());
   }
 
   @After
@@ -538,6 +540,19 @@ public class TestEncryptionZones {
         !wrapper.exists(pathFooBaz) && wrapper.exists(pathFooBar));
     assertEquals("Renamed file contents not the same",
         contents, DFSTestUtil.readFile(fs, pathFooBarFile));
+
+    // Verify that we can rename an EZ root
+    final Path newFoo = new Path(testRoot, "newfoo");
+    assertTrue("Rename of EZ root", fs.rename(pathFoo, newFoo));
+    assertTrue("Rename of EZ root failed",
+        !wrapper.exists(pathFoo) && wrapper.exists(newFoo));
+
+    // Verify that we can't rename an EZ root onto itself
+    try {
+      wrapper.rename(newFoo, newFoo);
+    } catch (IOException e) {
+      assertExceptionContains("are the same", e);
+    }
   }
 
   @Test(timeout = 60000)
@@ -985,7 +1000,7 @@ public class TestEncryptionZones {
 
     // Test when the parent directory becomes a different EZ
     fsWrapper.mkdir(zone1, FsPermission.getDirDefault(), true);
-    final String otherKey = "otherKey";
+    final String otherKey = "other_key";
     DFSTestUtil.createKey(otherKey, cluster, conf);
     dfsAdmin.createEncryptionZone(zone1, TEST_KEY);
 
@@ -1005,7 +1020,7 @@ public class TestEncryptionZones {
 
     // Test that the retry limit leads to an error
     fsWrapper.mkdir(zone1, FsPermission.getDirDefault(), true);
-    final String anotherKey = "anotherKey";
+    final String anotherKey = "another_key";
     DFSTestUtil.createKey(anotherKey, cluster, conf);
     dfsAdmin.createEncryptionZone(zone1, anotherKey);
     String keyToUse = otherKey;
@@ -1059,7 +1074,7 @@ public class TestEncryptionZones {
         addDelegationTokens(anyString(), (Credentials)any())).
         thenReturn(new Token<?>[] { testToken });
 
-    dfs.getClient().provider = keyProvider;
+    dfs.getClient().setKeyProvider(keyProvider);
 
     Credentials creds = new Credentials();
     final Token<?> tokens[] = dfs.addDelegationTokens("JobTracker", creds);

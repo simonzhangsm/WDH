@@ -86,11 +86,40 @@ public interface MRJobConfig {
 
   public static final String SKIP_OUTDIR = "mapreduce.job.skip.outdir";
 
+  // SPECULATIVE_SLOWNODE_THRESHOLD is obsolete and will be deleted in the future
+  @Deprecated
   public static final String SPECULATIVE_SLOWNODE_THRESHOLD = "mapreduce.job.speculative.slownodethreshold";
 
   public static final String SPECULATIVE_SLOWTASK_THRESHOLD = "mapreduce.job.speculative.slowtaskthreshold";
 
+  // SPECULATIVECAP is obsolete and will be deleted in the future
+  @Deprecated
   public static final String SPECULATIVECAP = "mapreduce.job.speculative.speculativecap";
+
+  public static final String SPECULATIVECAP_RUNNING_TASKS =
+      "mapreduce.job.speculative.speculative-cap-running-tasks";
+  public static final double DEFAULT_SPECULATIVECAP_RUNNING_TASKS =
+      0.1;
+
+  public static final String SPECULATIVECAP_TOTAL_TASKS =
+      "mapreduce.job.speculative.speculative-cap-total-tasks";
+  public static final double DEFAULT_SPECULATIVECAP_TOTAL_TASKS =
+      0.01;
+
+  public static final String SPECULATIVE_MINIMUM_ALLOWED_TASKS =
+      "mapreduce.job.speculative.minimum-allowed-tasks";
+  public static final int DEFAULT_SPECULATIVE_MINIMUM_ALLOWED_TASKS =
+      10;
+
+  public static final String SPECULATIVE_RETRY_AFTER_NO_SPECULATE =
+      "mapreduce.job.speculative.retry-after-no-speculate";
+  public static final long DEFAULT_SPECULATIVE_RETRY_AFTER_NO_SPECULATE =
+      1000L;
+
+  public static final String SPECULATIVE_RETRY_AFTER_SPECULATE =
+      "mapreduce.job.speculative.retry-after-speculate";
+  public static final long DEFAULT_SPECULATIVE_RETRY_AFTER_SPECULATE =
+      15000L;
 
   public static final String JOB_LOCAL_DIR = "mapreduce.job.local.dir";
 
@@ -139,6 +168,7 @@ public interface MRJobConfig {
   public static final String USER_LOG_RETAIN_HOURS = "mapreduce.job.userlog.retain.hours";
 
   public static final String MAPREDUCE_JOB_USER_CLASSPATH_FIRST = "mapreduce.job.user.classpath.first";
+  public static final String MAPREDUCE_TASK_CLASSPATH_PRECEDENCE = "mapreduce.task.classpath.user.precedence";
 
   public static final String MAPREDUCE_JOB_CLASSLOADER = "mapreduce.job.classloader";
 
@@ -785,6 +815,11 @@ public interface MRJobConfig {
   
   public static final String MR_APPLICATION_TYPE = "MAPREDUCE";
   
+  public static final String HEAP_MEMORY_MB_RATIO =
+      "mapreduce.job.heap.memory-mb.ratio";
+
+  public static final float DEFAULT_HEAP_MEMORY_MB_RATIO = 0.8f;
+
   public static final String MR_ENCRYPTED_INTERMEDIATE_DATA =
       "mapreduce.job.encrypted-intermediate-data";
   public static final boolean DEFAULT_MR_ENCRYPTED_INTERMEDIATE_DATA = false;

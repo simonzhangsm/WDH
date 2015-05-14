@@ -214,12 +214,10 @@ public class ConfigUtil {
         MRJobConfig.SKIP_RECORDS),
       new DeprecationDelta("mapred.skip.out.dir",
         MRJobConfig.SKIP_OUTDIR),
-      new DeprecationDelta("mapred.speculative.execution.slowNodeThreshold",
-        MRJobConfig.SPECULATIVE_SLOWNODE_THRESHOLD),
       new DeprecationDelta("mapred.speculative.execution.slowTaskThreshold",
         MRJobConfig.SPECULATIVE_SLOWTASK_THRESHOLD),
       new DeprecationDelta("mapred.speculative.execution.speculativeCap",
-        MRJobConfig.SPECULATIVECAP),
+        MRJobConfig.SPECULATIVECAP_RUNNING_TASKS),
       new DeprecationDelta("job.local.dir",
         MRJobConfig.JOB_LOCAL_DIR),
       new DeprecationDelta("mapreduce.inputformat.class",
@@ -530,7 +528,9 @@ public class ConfigUtil {
       new DeprecationDelta(JTConfig.JT_MAX_JOB_SPLIT_METAINFO_SIZE,
         MRJobConfig.SPLIT_METAINFO_MAXSIZE),
       new DeprecationDelta("mapred.input.dir.recursive",
-        FileInputFormat.INPUT_DIR_RECURSIVE)
+        FileInputFormat.INPUT_DIR_RECURSIVE),
+      new DeprecationDelta(MRJobConfig.MAPREDUCE_TASK_CLASSPATH_PRECEDENCE,
+          MRJobConfig.MAPREDUCE_JOB_USER_CLASSPATH_FIRST)
     });
   }
 

@@ -50,14 +50,13 @@ import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.Appl
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.ApplicationStateDataProto;
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerRecoveryProtos.EpochProto;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
-import org.apache.hadoop.yarn.server.records.Version;
 import org.apache.hadoop.yarn.server.records.impl.pb.VersionPBImpl;
+import org.apache.hadoop.yarn.server.records.Version;
 import org.apache.hadoop.yarn.server.resourcemanager.RMZKUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.AMRMTokenSecretManagerState;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationAttemptStateData;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.ApplicationStateData;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.Epoch;
-import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.RMDelegationTokenIdentifierData;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.AMRMTokenSecretManagerStatePBImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationAttemptStateDataPBImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationStateDataPBImpl;
@@ -153,7 +152,13 @@ public class ZKRMStateStore extends RMStateStore {
 
   @VisibleForTesting
   protected ZooKeeper zkClient;
-  private ZooKeeper oldZkClient;
+
+  /* activeZkClient is not used to do actual operations,
+   * it is only used to verify client session for watched events and
+   * it gets activated into zkClient on connection event.
+   */
+  @VisibleForTesting
+  ZooKeeper activeZkClient;
 
   /** Fencing related variables */
   private static final String FENCING_LOCK = "RM_ZK_FENCING_LOCK";
@@ -355,21 +360,14 @@ public class ZKRMStateStore extends RMStateStore {
   }
 
   private synchronized void closeZkClients() throws IOException {
-    if (zkClient != null) {
+    zkClient = null;
+    if (activeZkClient != null) {
       try {
-        zkClient.close();
+        activeZkClient.close();
       } catch (InterruptedException e) {
         throw new IOException("Interrupted while closing ZK", e);
       }
-      zkClient = null;
-    }
-    if (oldZkClient != null) {
-      try {
-        oldZkClient.close();
-      } catch (InterruptedException e) {
-        throw new IOException("Interrupted while closing old ZK", e);
-      }
-      oldZkClient = null;
+      activeZkClient = null;
     }
   }
 
@@ -489,10 +487,6 @@ public class ZKRMStateStore extends RMStateStore {
           DelegationKey key = new DelegationKey();
           key.readFields(fsIn);
           rmState.rmSecretManagerState.masterKeyState.add(key);
-          if (LOG.isDebugEnabled()) {
-            LOG.debug("Loaded delegation key: keyId=" + key.getKeyId()
-                + ", expirationDate=" + key.getExpiryDate());
-          }
         }
       } finally {
         is.close();
@@ -532,18 +526,12 @@ public class ZKRMStateStore extends RMStateStore {
 
       try {
         if (childNodeName.startsWith(DELEGATION_TOKEN_PREFIX)) {
-          RMDelegationTokenIdentifierData identifierData =
-              new RMDelegationTokenIdentifierData();
-          identifierData.readFields(fsIn);
           RMDelegationTokenIdentifier identifier =
-              identifierData.getTokenIdentifier();
-          long renewDate = identifierData.getRenewDate();
+              new RMDelegationTokenIdentifier();
+          identifier.readFields(fsIn);
+          long renewDate = fsIn.readLong();
           rmState.rmSecretManagerState.delegationTokenState.put(identifier,
               renewDate);
-          if (LOG.isDebugEnabled()) {
-            LOG.debug("Loaded RMDelegationTokenIdentifier: " + identifier
-                + " renewDate=" + renewDate);
-          }
         }
       } finally {
         is.close();
@@ -725,12 +713,11 @@ public class ZKRMStateStore extends RMStateStore {
   }
 
   @Override
-  protected synchronized void storeRMDelegationTokenAndSequenceNumberState(
-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
-      int latestSequenceNumber) throws Exception {
+  protected synchronized void storeRMDelegationTokenState(
+      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+      throws Exception {
     ArrayList<Op> opList = new ArrayList<Op>();
-    addStoreOrUpdateOps(
-        opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+    addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
     doMultiWithRetries(opList);
   }
 
@@ -754,59 +741,60 @@ public class ZKRMStateStore extends RMStateStore {
   }
 
   @Override
-  protected void updateRMDelegationTokenAndSequenceNumberInternal(
-      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
-      int latestSequenceNumber) throws Exception {
+  protected synchronized void updateRMDelegationTokenState(
+      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate)
+      throws Exception {
     ArrayList<Op> opList = new ArrayList<Op>();
     String nodeRemovePath =
         getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
             + rmDTIdentifier.getSequenceNumber());
     if (existsWithRetries(nodeRemovePath, true) == null) {
       // in case znode doesn't exist
-      addStoreOrUpdateOps(
-          opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, false);
       LOG.debug("Attempted to update a non-existing znode " + nodeRemovePath);
     } else {
       // in case znode exists
-      addStoreOrUpdateOps(
-          opList, rmDTIdentifier, renewDate, latestSequenceNumber, true);
+      addStoreOrUpdateOps(opList, rmDTIdentifier, renewDate, true);
     }
     doMultiWithRetries(opList);
   }
 
   private void addStoreOrUpdateOps(ArrayList<Op> opList,
       RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
-      int latestSequenceNumber, boolean isUpdate) throws Exception {
+      boolean isUpdate) throws Exception {
     // store RM delegation token
     String nodeCreatePath =
         getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
             + rmDTIdentifier.getSequenceNumber());
+    ByteArrayOutputStream tokenOs = new ByteArrayOutputStream();
+    DataOutputStream tokenOut = new DataOutputStream(tokenOs);
     ByteArrayOutputStream seqOs = new ByteArrayOutputStream();
     DataOutputStream seqOut = new DataOutputStream(seqOs);
-    RMDelegationTokenIdentifierData identifierData =
-        new RMDelegationTokenIdentifierData(rmDTIdentifier, renewDate);
+
     try {
+      rmDTIdentifier.write(tokenOut);
+      tokenOut.writeLong(renewDate);
       if (LOG.isDebugEnabled()) {
         LOG.debug((isUpdate ? "Storing " : "Updating ") + "RMDelegationToken_" +
             rmDTIdentifier.getSequenceNumber());
       }
 
       if (isUpdate) {
-        opList.add(Op.setData(nodeCreatePath, identifierData.toByteArray(), -1));
+        opList.add(Op.setData(nodeCreatePath, tokenOs.toByteArray(), -1));
       } else {
-        opList.add(Op.create(nodeCreatePath, identifierData.toByteArray(), zkAcl,
+        opList.add(Op.create(nodeCreatePath, tokenOs.toByteArray(), zkAcl,
             CreateMode.PERSISTENT));
+        // Update Sequence number only while storing DT
+        seqOut.writeInt(rmDTIdentifier.getSequenceNumber());
+        if (LOG.isDebugEnabled()) {
+          LOG.debug((isUpdate ? "Storing " : "Updating ") +
+                    dtSequenceNumberPath + ". SequenceNumber: "
+                    + rmDTIdentifier.getSequenceNumber());
+        }
+        opList.add(Op.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1));
       }
-
-
-     seqOut.writeInt(latestSequenceNumber);
-     if (LOG.isDebugEnabled()) {
-        LOG.debug((isUpdate ? "Storing " : "Updating ") + dtSequenceNumberPath +
-            ". SequenceNumber: " + latestSequenceNumber);
-      }
-
-     opList.add(Op.setData(dtSequenceNumberPath, seqOs.toByteArray(), -1));
     } finally {
+      tokenOs.close();
       seqOs.close();
     }
   }
@@ -860,11 +848,16 @@ public class ZKRMStateStore extends RMStateStore {
    * hides the ZK methods of the store from its public interface
    */
   private final class ForwardingWatcher implements Watcher {
+    private ZooKeeper watchedZkClient;
+
+    public ForwardingWatcher(ZooKeeper client) {
+      this.watchedZkClient = client;
+    }
 
     @Override
     public void process(WatchedEvent event) {
       try {
-        ZKRMStateStore.this.processWatchEvent(event);
+        ZKRMStateStore.this.processWatchEvent(watchedZkClient, event);
       } catch (Throwable t) {
         LOG.error("Failed to process watcher event " + event + ": "
             + StringUtils.stringifyException(t));
@@ -875,8 +868,16 @@ public class ZKRMStateStore extends RMStateStore {
   @VisibleForTesting
   @Private
   @Unstable
-  public synchronized void processWatchEvent(WatchedEvent event)
-      throws Exception {
+  public synchronized void processWatchEvent(ZooKeeper zk,
+      WatchedEvent event) throws Exception {
+    // only process watcher event from current ZooKeeper Client session.
+    if (zk != activeZkClient) {
+      LOG.info("Ignore watcher event type: " + event.getType() +
+          " with state:" + event.getState() + " for path:" +
+          event.getPath() + " from old session");
+      return;
+    }
+
     Event.EventType eventType = event.getType();
     LOG.info("Watcher event type: " + eventType + " with state:"
         + event.getState() + " for path:" + event.getPath() + " for " + this);
@@ -887,17 +888,15 @@ public class ZKRMStateStore extends RMStateStore {
       switch (event.getState()) {
         case SyncConnected:
           LOG.info("ZKRMStateStore Session connected");
-          if (oldZkClient != null) {
+          if (zkClient == null) {
             // the SyncConnected must be from the client that sent Disconnected
-            zkClient = oldZkClient;
-            oldZkClient = null;
+            zkClient = activeZkClient;
             ZKRMStateStore.this.notifyAll();
             LOG.info("ZKRMStateStore Session restored");
           }
           break;
         case Disconnected:
           LOG.info("ZKRMStateStore Session disconnected");
-          oldZkClient = zkClient;
           zkClient = null;
           break;
         case Expired:
@@ -1081,6 +1080,8 @@ public class ZKRMStateStore extends RMStateStore {
       switch (code) {
         case CONNECTIONLOSS:
         case OPERATIONTIMEOUT:
+        case SESSIONEXPIRED:
+        case SESSIONMOVED:
           return true;
         default:
           break;
@@ -1109,6 +1110,7 @@ public class ZKRMStateStore extends RMStateStore {
           if (shouldRetry(ke.code()) && ++retry < numRetries) {
             LOG.info("Retrying operation on ZK. Retry no. " + retry);
             Thread.sleep(zkRetryInterval);
+            createConnection();
             continue;
           }
           LOG.info("Maxed out ZK retries. Giving up!");
@@ -1124,7 +1126,8 @@ public class ZKRMStateStore extends RMStateStore {
     for (int retries = 0; retries < numRetries && zkClient == null;
         retries++) {
       try {
-        zkClient = getNewZooKeeper();
+        activeZkClient = getNewZooKeeper();
+        zkClient = activeZkClient;
         for (ZKUtil.ZKAuthInfo zkAuth : zkAuths) {
           zkClient.addAuthInfo(zkAuth.getScheme(), zkAuth.getAuth());
         }
@@ -1154,7 +1157,7 @@ public class ZKRMStateStore extends RMStateStore {
   protected synchronized ZooKeeper getNewZooKeeper()
       throws IOException, InterruptedException {
     ZooKeeper zk = new ZooKeeper(zkHostPort, zkSessionTimeout, null);
-    zk.register(new ForwardingWatcher());
+    zk.register(new ForwardingWatcher(zk));
     return zk;
   }
 

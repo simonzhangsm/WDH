@@ -291,7 +291,7 @@ public class TestContainerAllocation {
   // This is to test fetching AM container will be retried, if AM container is
   // not fetchable since DNS is unavailable causing container token/NMtoken
   // creation failure.
-  @Test(timeout = 20000)
+  @Test(timeout = 30000)
   public void testAMContainerAllocationWhenDNSUnavailable() throws Exception {
     MockRM rm1 = new MockRM(conf) {
       @Override

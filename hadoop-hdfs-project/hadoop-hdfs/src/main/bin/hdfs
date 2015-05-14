@@ -64,10 +64,11 @@ function print_usage(){
   echo "  nfs3                 run an NFS version 3 gateway"
   echo "  cacheadmin           configure the HDFS cache"
   echo "  crypto               configure HDFS encryption zones"
-  echo "  storagepolicies      get all the existing block storage policies"
+  echo "  storagepolicies      list/get/set block storage policies"
   echo "  version              print the version"
   echo ""
   echo "Most commands print help when invoked w/o parameters."
+  # There are also debug commands, but they don't show up in this listing.
 }
 
 if [ $# = 0 ]; then
@@ -130,12 +131,42 @@ fi
 
 if [ "$COMMAND" = "namenode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.NameNode'
+  # Set SENTRY_HOME if possible and add Sentry plugin jars to classpath
+  if [[ -z "$SENTRY_HOME" ]]
+  then
+    # HADOOP_HDFS_HOME should have been set by hadoop-config.sh
+    if [[ -d ${HADOOP_HDFS_HOME}/../sentry ]]
+    then
+      export SENTRY_HOME=`readlink -m ${HADOOP_HDFS_HOME}/../sentry`
+    fi
+  fi
+  if [[ -n "$SENTRY_HOME" ]]
+  then
+    for f in ${SENTRY_HOME}/lib/plugins/*.jar; do
+     CLASSPATH=${CLASSPATH}:${f}
+    done
+  fi
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_NAMENODE_OPTS"
 elif [ "$COMMAND" = "zkfc" ] ; then
   CLASS='org.apache.hadoop.hdfs.tools.DFSZKFailoverController'
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_ZKFC_OPTS"
 elif [ "$COMMAND" = "secondarynamenode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.namenode.SecondaryNameNode'
+  # Set SENTRY_HOME if possible and add Sentry plugin jars to classpath
+  if [[ -z "$SENTRY_HOME" ]]
+  then
+    # HADOOP_HDFS_HOME should have been set by hadoop-config.sh
+    if [[ -d ${HADOOP_HDFS_HOME}/../sentry ]]
+    then
+      export SENTRY_HOME=`readlink -m ${HADOOP_HDFS_HOME}/../sentry`
+    fi
+  fi
+  if [[ -n "$SENTRY_HOME" ]]
+  then
+    for f in ${SENTRY_HOME}/lib/plugins/*.jar; do
+     CLASSPATH=${CLASSPATH}:${f}
+    done
+  fi
   HADOOP_OPTS="$HADOOP_OPTS $HADOOP_SECONDARYNAMENODE_OPTS"
 elif [ "$COMMAND" = "datanode" ] ; then
   CLASS='org.apache.hadoop.hdfs.server.datanode.DataNode'
@@ -167,7 +198,7 @@ elif [ "$COMMAND" = "mover" ] ; then
   CLASS=org.apache.hadoop.hdfs.server.mover.Mover
   HADOOP_OPTS="${HADOOP_OPTS} ${HADOOP_MOVER_OPTS}"
 elif [ "$COMMAND" = "storagepolicies" ] ; then
-  CLASS=org.apache.hadoop.hdfs.tools.GetStoragePolicies
+  CLASS=org.apache.hadoop.hdfs.tools.StoragePolicyAdmin
 elif [ "$COMMAND" = "jmxget" ] ; then
   CLASS=org.apache.hadoop.hdfs.tools.JMXGet
 elif [ "$COMMAND" = "oiv" ] ; then
@@ -198,6 +229,8 @@ elif [ "$COMMAND" = "crypto" ] ; then
   CLASS=org.apache.hadoop.hdfs.tools.CryptoAdmin
 elif [ "$COMMAND" = "version" ] ; then
   CLASS=org.apache.hadoop.util.VersionInfo
+elif [ "$COMMAND" = "debug" ]; then
+  CLASS=org.apache.hadoop.hdfs.tools.DebugAdmin
 else
   CLASS="$COMMAND"
 fi

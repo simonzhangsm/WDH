@@ -672,7 +672,7 @@ public abstract class Storage extends StorageInfo {
      */
     public void lock() throws IOException {
       if (isShared()) {
-        LOG.info("Locking is disabled");
+        LOG.info("Locking is disabled for " + this.root);
         return;
       }
       FileLock newLock = tryLock();
@@ -818,6 +818,21 @@ public abstract class Storage extends StorageInfo {
   
   protected void addStorageDir(StorageDirectory sd) {
     storageDirs.add(sd);
+  }
+
+  /**
+   * Returns true if the storage directory on the given directory is already
+   * loaded.
+   * @param root the root directory of a {@link StorageDirectory}
+   * @throws IOException if failed to get canonical path.
+   */
+  protected boolean containsStorageDir(File root) throws IOException {
+    for (StorageDirectory sd : storageDirs) {
+      if (sd.getRoot().getCanonicalPath().equals(root.getCanonicalPath())) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

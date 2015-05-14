@@ -28,11 +28,11 @@ import java.util.List;
 import com.google.common.base.Preconditions;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.apache.commons.logging.impl.Log4JLogger;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.DFSTestUtil;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.protocol.Block;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
@@ -46,6 +46,7 @@ import org.apache.hadoop.hdfs.server.blockmanagement.BlockManagerTestUtil;
 import org.apache.hadoop.hdfs.server.datanode.DataNode;
 import org.apache.hadoop.hdfs.server.datanode.DataStorage;
 import org.apache.hadoop.hdfs.server.protocol.BlockCommand;
+import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
@@ -60,6 +61,7 @@ import org.apache.hadoop.io.EnumSetWritable;
 import org.apache.hadoop.net.DNS;
 import org.apache.hadoop.net.NetworkTopology;
 import org.apache.hadoop.security.Groups;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Time;
 import org.apache.hadoop.util.Tool;
@@ -144,12 +146,11 @@ public class NNThroughputBenchmark implements Tool {
   static void setNameNodeLoggingLevel(Level logLevel) {
     LOG.fatal("Log level = " + logLevel.toString());
     // change log level to NameNode logs
-    LogManager.getLogger(NameNode.class.getName()).setLevel(logLevel);
-    ((Log4JLogger)NameNode.stateChangeLog).getLogger().setLevel(logLevel);
-    LogManager.getLogger(NetworkTopology.class.getName()).setLevel(logLevel);
-    LogManager.getLogger(FSNamesystem.class.getName()).setLevel(logLevel);
-    LogManager.getLogger(LeaseManager.class.getName()).setLevel(logLevel);
-    LogManager.getLogger(Groups.class.getName()).setLevel(logLevel);
+    DFSTestUtil.setNameNodeLogLevel(logLevel);
+    GenericTestUtils.setLogLevel(LogManager.getLogger(
+            NetworkTopology.class.getName()), logLevel);
+    GenericTestUtils.setLogLevel(LogManager.getLogger(
+            Groups.class.getName()), logLevel);
   }
 
   /**
@@ -938,7 +939,8 @@ public class NNThroughputBenchmark implements Tool {
               new BlockListAsLongs(null, null).getBlockListAsLongs())
       };
       nameNodeProto.blockReport(dnRegistration, 
-          nameNode.getNamesystem().getBlockPoolId(), reports);
+          nameNode.getNamesystem().getBlockPoolId(), reports,
+              new BlockReportContext(1, 0, System.nanoTime()));
     }
 
     /**
@@ -1181,8 +1183,9 @@ public class NNThroughputBenchmark implements Tool {
       long start = Time.now();
       StorageBlockReport[] report = { new StorageBlockReport(
           dn.storage, dn.getBlockReportList()) };
-      nameNodeProto.blockReport(dn.dnRegistration, nameNode.getNamesystem()
-          .getBlockPoolId(), report);
+      nameNodeProto.blockReport(dn.dnRegistration,
+          nameNode.getNamesystem().getBlockPoolId(), report,
+          new BlockReportContext(1, 0, System.nanoTime()));
       long end = Time.now();
       return end-start;
     }

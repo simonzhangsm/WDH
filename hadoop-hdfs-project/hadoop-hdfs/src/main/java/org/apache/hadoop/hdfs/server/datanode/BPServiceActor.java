@@ -22,14 +22,18 @@ import static org.apache.hadoop.util.Time.now;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketTimeoutException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
 
 import com.google.common.base.Joiner;
 import org.apache.commons.logging.Log;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.ha.HAServiceProtocol.HAServiceState;
+import org.apache.hadoop.hdfs.client.BlockReportOptions;
 import org.apache.hadoop.hdfs.DFSUtil;
-import org.apache.hadoop.hdfs.StorageType;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
 import org.apache.hadoop.hdfs.protocol.DatanodeInfo;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
@@ -39,6 +43,7 @@ import org.apache.hadoop.hdfs.protocol.UnregisteredNodeException;
 import org.apache.hadoop.hdfs.protocolPB.DatanodeProtocolClientSideTranslatorPB;
 import org.apache.hadoop.hdfs.server.common.IncorrectVersionException;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeStorage;
@@ -115,6 +120,8 @@ class BPServiceActor implements Runnable {
   private final DNConf dnConf;
 
   private DatanodeRegistration bpRegistration;
+  final LinkedList<BPServiceActorAction> bpThreadQueue 
+      = new LinkedList<BPServiceActorAction>();
 
   BPServiceActor(InetSocketAddress nnAddr, BPOfferService bpos) {
     this.bpos = bpos;
@@ -249,26 +256,6 @@ class BPServiceActor implements Runnable {
     resetBlockReportTime = true; // reset future BRs for randomness
   }
 
-  void reportBadBlocks(ExtendedBlock block,
-      String storageUuid, StorageType storageType) {
-    if (bpRegistration == null) {
-      return;
-    }
-    DatanodeInfo[] dnArr = { new DatanodeInfo(bpRegistration) };
-    String[] uuids = { storageUuid };
-    StorageType[] types = { storageType };
-    LocatedBlock[] blocks = { new LocatedBlock(block, dnArr, uuids, types) };
-    
-    try {
-      bpNamenode.reportBadBlocks(blocks);  
-    } catch (IOException e){
-      /* One common reason is that NameNode could be in safe mode.
-       * Should we keep on retrying in that case?
-       */
-      LOG.warn("Failed to report bad block " + block + " to namenode : "
-          + " Exception", e);
-    }
-  }
   
   /**
    * Report received blocks and delete hints to the Namenode for each
@@ -445,6 +432,17 @@ class BPServiceActor implements Runnable {
     return sendImmediateIBR;
   }
 
+  private long prevBlockReportId = 0;
+
+  private long generateUniqueBlockReportId() {
+    long id = System.nanoTime();
+    if (id <= prevBlockReportId) {
+      id = prevBlockReportId + 1;
+    }
+    prevBlockReportId = id;
+    return id;
+  }
+
   /**
    * Report the list blocks to the Namenode
    * @return DatanodeCommands returned by the NN. May be null.
@@ -457,7 +455,7 @@ class BPServiceActor implements Runnable {
       return null;
     }
 
-    ArrayList<DatanodeCommand> cmds = new ArrayList<DatanodeCommand>();
+    final ArrayList<DatanodeCommand> cmds = new ArrayList<DatanodeCommand>();
 
     // Flush any block information that precedes the block report. Otherwise
     // we have a chance that we will miss the delHint information
@@ -484,40 +482,58 @@ class BPServiceActor implements Runnable {
     }
 
     // Send the reports to the NN.
-    int numReportsSent;
+    int numReportsSent = 0;
+    int numRPCs = 0;
+    boolean success = false;
     long brSendStartTime = now();
-    if (totalBlockCount < dnConf.blockReportSplitThreshold) {
-      // Below split threshold, send all reports in a single message.
-      numReportsSent = 1;
-      DatanodeCommand cmd =
-          bpNamenode.blockReport(bpRegistration, bpos.getBlockPoolId(), reports);
-      if (cmd != null) {
-        cmds.add(cmd);
-      }
-    } else {
-      // Send one block report per message.
-      numReportsSent = i;
-      for (StorageBlockReport report : reports) {
-        StorageBlockReport singleReport[] = { report };
+    long reportId = generateUniqueBlockReportId();
+    try {
+      if (totalBlockCount < dnConf.blockReportSplitThreshold) {
+        // Below split threshold, send all reports in a single message.
         DatanodeCommand cmd = bpNamenode.blockReport(
-            bpRegistration, bpos.getBlockPoolId(), singleReport);
+            bpRegistration, bpos.getBlockPoolId(), reports,
+              new BlockReportContext(1, 0, reportId));
+        numRPCs = 1;
+        numReportsSent = reports.length;
         if (cmd != null) {
           cmds.add(cmd);
         }
+      } else {
+        // Send one block report per message.
+        for (int r = 0; r < reports.length; r++) {
+          StorageBlockReport singleReport[] = { reports[r] };
+          DatanodeCommand cmd = bpNamenode.blockReport(
+              bpRegistration, bpos.getBlockPoolId(), singleReport,
+              new BlockReportContext(reports.length, r, reportId));
+          numReportsSent++;
+          numRPCs++;
+          if (cmd != null) {
+            cmds.add(cmd);
+          }
+        }
       }
+      success = true;
+    } finally {
+      // Log the block report processing stats from Datanode perspective
+      long brSendCost = now() - brSendStartTime;
+      long brCreateCost = brSendStartTime - brCreateStartTime;
+      dn.getMetrics().addBlockReport(brSendCost);
+      final int nCmds = cmds.size();
+      LOG.info((success ? "S" : "Uns") +
+          "uccessfully sent block report 0x" +
+          Long.toHexString(reportId) + ",  containing " + reports.length +
+          " storage report(s), of which we sent " + numReportsSent + "." +
+          " The reports had " + totalBlockCount +
+          " total blocks and used " + numRPCs +
+          " RPC(s). This took " + brCreateCost +
+          " msec to generate and " + brSendCost +
+          " msecs for RPC and NN processing." +
+          " Got back " +
+          ((nCmds == 0) ? "no commands" :
+              ((nCmds == 1) ? "one command: " + cmds.get(0) :
+                  (nCmds + " commands: " + Joiner.on("; ").join(cmds)))) +
+          ".");
     }
-
-    // Log the block report processing stats from Datanode perspective
-    long brSendCost = now() - brSendStartTime;
-    long brCreateCost = brSendStartTime - brCreateStartTime;
-    dn.getMetrics().addBlockReport(brSendCost);
-    LOG.info("Sent " + numReportsSent + " blockreports " + totalBlockCount +
-        " blocks total. Took " + brCreateCost +
-        " msec to generate and " + brSendCost +
-        " msecs for RPC and NN processing. " +
-        " Got back commands " +
-            (cmds.size() == 0 ? "none" : Joiner.on("; ").join(cmds)));
-
     scheduleNextBlockReport(startTime);
     return cmds.size() == 0 ? null : cmds;
   }
@@ -718,12 +734,6 @@ class BPServiceActor implements Runnable {
         DatanodeCommand cmd = cacheReport();
         processCommand(new DatanodeCommand[]{ cmd });
 
-        // Now safe to start scanning the block pool.
-        // If it has already been started, this is a no-op.
-        if (dn.blockScanner != null) {
-          dn.blockScanner.addBlockPool(bpos.getBlockPoolId());
-        }
-
         //
         // There is no work to do;  sleep until hearbeat timer elapses, 
         // or work arrives, and then iterate again.
@@ -758,6 +768,7 @@ class BPServiceActor implements Runnable {
       } catch (IOException e) {
         LOG.warn("IOException in offerService", e);
       }
+      processQueueMessages();
     } // while (shouldRun())
   } // offerService
 
@@ -892,14 +903,6 @@ class BPServiceActor implements Runnable {
     return true;
   }
 
-  void trySendErrorReport(int errCode, String errMsg) {
-    try {
-      bpNamenode.errorReport(bpRegistration, errCode, errMsg);
-    } catch(IOException e) {
-      LOG.warn("Error reporting an error to NameNode " + nnAddr,
-          e);
-    }
-  }
 
   /**
    * Report a bad block from another DN in this cluster.
@@ -967,7 +970,6 @@ class BPServiceActor implements Runnable {
 
     /**
      * Add pending incremental block report for a single block.
-     * @param blockID
      * @param blockInfo
      */
     void putBlockInfo(ReceivedDeletedBlockInfo blockInfo) {
@@ -984,6 +986,48 @@ class BPServiceActor implements Runnable {
      */
     boolean removeBlockInfo(ReceivedDeletedBlockInfo blockInfo) {
       return (pendingIncrementalBR.remove(blockInfo.getBlock().getBlockId()) != null);
+    }
+  }
+
+  void triggerBlockReport(BlockReportOptions options) throws IOException {
+    if (options.isIncremental()) {
+      LOG.info(bpos.toString() + ": scheduling an incremental block report.");
+      synchronized(pendingIncrementalBRperStorage) {
+        sendImmediateIBR = true;
+        pendingIncrementalBRperStorage.notifyAll();
+      }
+    } else {
+      LOG.info(bpos.toString() + ": scheduling a full block report.");
+      synchronized(pendingIncrementalBRperStorage) {
+        lastBlockReport = 0;
+        pendingIncrementalBRperStorage.notifyAll();
+      }
+    }
+  }
+  
+  public void bpThreadEnqueue(BPServiceActorAction action) {
+    synchronized (bpThreadQueue) {
+      if (!bpThreadQueue.contains(action)) {
+        bpThreadQueue.add(action);
+      }
+    }
+  }
+
+  private void processQueueMessages() {
+    LinkedList<BPServiceActorAction> duplicateQueue;
+    synchronized (bpThreadQueue) {
+      duplicateQueue = new LinkedList<BPServiceActorAction>(bpThreadQueue);
+      bpThreadQueue.clear();
+    }
+    while (!duplicateQueue.isEmpty()) {
+      BPServiceActorAction actionItem = duplicateQueue.remove();
+      try {
+        actionItem.reportTo(bpNamenode, bpRegistration);
+      } catch (BPServiceActorActionException baae) {
+        LOG.warn(baae.getMessage() + nnAddr , baae);
+        // Adding it back to the queue if not present
+        bpThreadEnqueue(actionItem);
+      }
     }
   }
 }

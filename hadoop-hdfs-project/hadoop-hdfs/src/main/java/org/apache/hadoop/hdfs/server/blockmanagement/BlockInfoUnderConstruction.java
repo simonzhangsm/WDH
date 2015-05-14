@@ -153,14 +153,14 @@ public class BlockInfoUnderConstruction extends BlockInfo {
    * Create block and set its state to
    * {@link BlockUCState#UNDER_CONSTRUCTION}.
    */
-  public BlockInfoUnderConstruction(Block blk, int replication) {
+  public BlockInfoUnderConstruction(Block blk, short replication) {
     this(blk, replication, BlockUCState.UNDER_CONSTRUCTION, null);
   }
 
   /**
    * Create a block that is currently being constructed.
    */
-  public BlockInfoUnderConstruction(Block blk, int replication,
+  public BlockInfoUnderConstruction(Block blk, short replication,
                              BlockUCState state,
                              DatanodeStorageInfo[] targets) {
     super(blk, replication);
@@ -246,7 +246,7 @@ public class BlockInfoUnderConstruction extends BlockInfo {
       if (genStamp != r.getGenerationStamp()) {
         r.getExpectedStorageLocation().removeBlock(this);
         NameNode.blockStateChangeLog.info("BLOCK* Removing stale replica "
-            + "from location: " + r.getExpectedStorageLocation());
+            + "from location: {}", r.getExpectedStorageLocation());
       }
     }
   }
@@ -313,8 +313,8 @@ public class BlockInfoUnderConstruction extends BlockInfo {
     if (primary != null) {
       primary.getExpectedStorageLocation().getDatanodeDescriptor().addBlockToBeRecovered(this);
       primary.setChosenAsPrimary(true);
-      NameNode.blockStateChangeLog.info("BLOCK* " + this
-        + " recovery started, primary=" + primary);
+      NameNode.blockStateChangeLog.info(
+          "BLOCK* {} recovery started, primary={}", this, primary);
     }
   }
 

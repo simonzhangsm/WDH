@@ -218,7 +218,9 @@ class BPOfferService {
                        String storageUuid, StorageType storageType) {
     checkBlock(block);
     for (BPServiceActor actor : bpServices) {
-      actor.reportBadBlocks(block, storageUuid, storageType);
+      ReportBadBlockAction rbbAction = new ReportBadBlockAction
+          (block, storageUuid, storageType);
+      actor.bpThreadEnqueue(rbbAction);
     }
   }
   
@@ -415,7 +417,9 @@ class BPOfferService {
    */
   void trySendErrorReport(int errCode, String errMsg) {
     for (BPServiceActor actor : bpServices) {
-      actor.trySendErrorReport(errCode, errMsg);
+      ErrorReportAction errorReportAction = new ErrorReportAction 
+          (errCode, errMsg);
+      actor.bpThreadEnqueue(errorReportAction);
     }
   }
 
@@ -657,9 +661,6 @@ class BPOfferService {
       //
       Block toDelete[] = bcmd.getBlocks();
       try {
-        if (dn.blockScanner != null) {
-          dn.blockScanner.deleteBlocks(bcmd.getBlockPoolId(), toDelete);
-        }
         // using global fsdataset
         dn.getFSDataset().invalidate(bcmd.getBlockPoolId(), toDelete);
       } catch(IOException e) {

@@ -37,6 +37,7 @@ import org.apache.hadoop.fs.ChecksumException;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.datatransfer.PacketHeader;
+import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsVolumeReference;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.LengthInputStream;
 import org.apache.hadoop.hdfs.util.DataTransferThrottler;
 import org.apache.hadoop.io.IOUtils;
@@ -140,6 +141,8 @@ class BlockSender implements java.io.Closeable {
   
   /** The file descriptor of the block being sent */
   private FileDescriptor blockInFd;
+  /** The reference to the volume where the block is located */
+  private FsVolumeReference volumeRef;
 
   // Cache-management related fields
   private final long readaheadLength;
@@ -253,6 +256,9 @@ class BlockSender implements java.io.Closeable {
       // use normal transfer in those cases
       this.transferToAllowed = datanode.getDnConf().transferToAllowed &&
         (!is32Bit || length <= Integer.MAX_VALUE);
+
+      // Obtain a reference before reading data
+      this.volumeRef = datanode.data.getVolume(block).obtainReference();
 
       /* 
        * (corruptChecksumOK, meta_file_exist): operation
@@ -417,6 +423,10 @@ class BlockSender implements java.io.Closeable {
       blockIn = null;
       blockInFd = null;
     }
+    if (volumeRef != null) {
+      IOUtils.cleanup(null, volumeRef);
+      volumeRef = null;
+    }
     // throw IOException if there is any
     if(ioe!= null) {
       throw ioe;
@@ -571,12 +581,9 @@ class BlockSender implements java.io.Closeable {
          * writing to client timed out.  This happens if the client reads
          * part of a block and then decides not to read the rest (but leaves
          * the socket open).
+         * 
+         * Reporting of this case is done in DataXceiver#run
          */
-        if (LOG.isTraceEnabled()) {
-          LOG.trace("Failed to send data:", e);
-        } else {
-          LOG.info("Failed to send data: " + e);
-        }
       } else {
         /* Exception while writing to the client. Connection closure from
          * the other end is mostly the case and we do not care much about
@@ -591,6 +598,9 @@ class BlockSender implements java.io.Closeable {
         if (!ioem.startsWith("Broken pipe") && !ioem.startsWith("Connection reset")) {
           LOG.error("BlockSender.sendChunks() exception: ", e);
         }
+        datanode.getBlockScanner().markSuspectBlock(
+              volumeRef.getVolume().getStorageID(),
+              block);
       }
       throw ioeToSocketException(e);
     }

@@ -48,7 +48,7 @@ public class TestEncryptionZonesWithHA {
   private FileSystemTestHelper fsHelper;
   private File testRootDir;
 
-  private final String TEST_KEY = "testKey";
+  private final String TEST_KEY = "test_key";
 
 
   @Before
@@ -80,7 +80,7 @@ public class TestEncryptionZonesWithHA {
     dfsAdmin1 = new HdfsAdmin(cluster.getURI(1), conf);
     KeyProviderCryptoExtension nn0Provider =
         cluster.getNameNode(0).getNamesystem().getProvider();
-    fs.getClient().provider = nn0Provider;
+    fs.getClient().setKeyProvider(nn0Provider);
   }
 
   @After

@@ -54,7 +54,9 @@ public class TestCommitBlockSynchronization {
     // set file's parent as root and put the file to inodeMap, so
     // FSNamesystem's isFileDeleted() method will return false on this file
     if (file.getParent() == null) {
-      INodeDirectory parent = mock(INodeDirectory.class);
+      INodeDirectory mparent = mock(INodeDirectory.class);
+      INodeDirectory parent = new INodeDirectory(mparent.getId(), new byte[0],
+          mparent.getPermissionStatus(), mparent.getAccessTime());
       parent.setLocalName(new byte[0]);
       parent.addChild(file);
       file.setParent(parent);
@@ -63,7 +65,7 @@ public class TestCommitBlockSynchronization {
 
     FSNamesystem namesystemSpy = spy(namesystem);
     BlockInfoUnderConstruction blockInfo = new BlockInfoUnderConstruction(
-        block, 1, HdfsServerConstants.BlockUCState.UNDER_CONSTRUCTION, targets);
+        block, (short) 1, HdfsServerConstants.BlockUCState.UNDER_CONSTRUCTION, targets);
     blockInfo.setBlockCollection(file);
     blockInfo.setGenerationStamp(genStamp);
     blockInfo.initializeBlockRecovery(genStamp);
@@ -100,7 +102,7 @@ public class TestCommitBlockSynchronization {
         lastBlock, genStamp, length, false, false, newTargets, null);
 
     // Simulate 'completing' the block.
-    BlockInfo completedBlockInfo = new BlockInfo(block, 1);
+    BlockInfo completedBlockInfo = new BlockInfo(block, (short) 1);
     completedBlockInfo.setBlockCollection(file);
     completedBlockInfo.setGenerationStamp(genStamp);
     doReturn(completedBlockInfo).when(namesystemSpy)
@@ -171,7 +173,7 @@ public class TestCommitBlockSynchronization {
     namesystemSpy.commitBlockSynchronization(
         lastBlock, genStamp, length, true, false, newTargets, null);
 
-    BlockInfo completedBlockInfo = new BlockInfo(block, 1);
+    BlockInfo completedBlockInfo = new BlockInfo(block, (short) 1);
     completedBlockInfo.setBlockCollection(file);
     completedBlockInfo.setGenerationStamp(genStamp);
     doReturn(completedBlockInfo).when(namesystemSpy)

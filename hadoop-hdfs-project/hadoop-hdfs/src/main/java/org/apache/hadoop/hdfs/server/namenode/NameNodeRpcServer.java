@@ -35,7 +35,7 @@ import java.util.List;
 import java.util.Set;
 
 import com.google.common.collect.Lists;
-import org.apache.commons.logging.Log;
+
 import org.apache.hadoop.HadoopIllegalArgumentException;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
@@ -68,7 +68,8 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSUtil;
 import org.apache.hadoop.hdfs.HDFSPolicyProvider;
 import org.apache.hadoop.hdfs.inotify.Event;
-import org.apache.hadoop.hdfs.inotify.EventsList;
+import org.apache.hadoop.hdfs.inotify.EventBatch;
+import org.apache.hadoop.hdfs.inotify.EventBatchList;
 import org.apache.hadoop.hdfs.protocol.AclException;
 import org.apache.hadoop.hdfs.protocol.AlreadyBeingCreatedException;
 import org.apache.hadoop.hdfs.protocol.BlockListAsLongs;
@@ -118,6 +119,7 @@ import org.apache.hadoop.hdfs.server.common.IncorrectVersionException;
 import org.apache.hadoop.hdfs.server.namenode.NameNode.OperationCategory;
 import org.apache.hadoop.hdfs.server.namenode.metrics.NameNodeMetrics;
 import org.apache.hadoop.hdfs.server.namenode.web.resources.NamenodeWebHdfsMethods;
+import org.apache.hadoop.hdfs.server.protocol.BlockReportContext;
 import org.apache.hadoop.hdfs.server.protocol.BlocksWithLocations;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeCommand;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeProtocol;
@@ -172,6 +174,7 @@ import org.apache.hadoop.tracing.TraceAdminProtocolPB;
 import org.apache.hadoop.tracing.TraceAdminProtocolServerSideTranslatorPB;
 import org.apache.hadoop.util.VersionInfo;
 import org.apache.hadoop.util.VersionUtil;
+import org.slf4j.Logger;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.protobuf.BlockingService;
@@ -182,9 +185,10 @@ import com.google.protobuf.BlockingService;
  */
 class NameNodeRpcServer implements NamenodeProtocols {
   
-  private static final Log LOG = NameNode.LOG;
-  private static final Log stateChangeLog = NameNode.stateChangeLog;
-  private static final Log blockStateChangeLog = NameNode.blockStateChangeLog;
+  private static final Logger LOG = NameNode.LOG;
+  private static final Logger stateChangeLog = NameNode.stateChangeLog;
+  private static final Logger blockStateChangeLog = NameNode
+      .blockStateChangeLog;
   
   // Dependencies from other parts of NN.
   protected final FSNamesystem namesystem;
@@ -1079,7 +1083,8 @@ class NameNodeRpcServer implements NamenodeProtocols {
 
   @Override // DatanodeProtocol
   public DatanodeCommand blockReport(DatanodeRegistration nodeReg,
-      String poolId, StorageBlockReport[] reports) throws IOException {
+        String poolId, StorageBlockReport[] reports,
+        BlockReportContext context) throws IOException {
     verifyRequest(nodeReg);
     if(blockStateChangeLog.isDebugEnabled()) {
       blockStateChangeLog.debug("*BLOCK* NameNode.blockReport: "
@@ -1087,14 +1092,15 @@ class NameNodeRpcServer implements NamenodeProtocols {
     }
     final BlockManager bm = namesystem.getBlockManager(); 
     boolean noStaleStorages = false;
-    for(StorageBlockReport r : reports) {
-      final BlockListAsLongs blocks = new BlockListAsLongs(r.getBlocks());
+    for (int r = 0; r < reports.length; r++) {
+      final BlockListAsLongs blocks = new BlockListAsLongs(reports[r].getBlocks());
       //
       // BlockManager.processReport accumulates information of prior calls
       // for the same node and storage, so the value returned by the last
       // call of this loop is the final updated value for noStaleStorage.
       //
-      noStaleStorages = bm.processReport(nodeReg, r.getStorage(), blocks);
+      noStaleStorages = bm.processReport(nodeReg, reports[r].getStorage(),
+          blocks, context, (r == reports.length - 1));
       metrics.incrStorageBlockReportOps();
     }
 
@@ -1290,7 +1296,7 @@ class NameNodeRpcServer implements NamenodeProtocols {
         IncorrectVersionException ive = new IncorrectVersionException(
             messagePrefix + " and CTime of DN ('" + dnCTime +
             "') does not match CTime of NN ('" + nnCTime + "')");
-        LOG.warn(ive);
+        LOG.warn(ive.toString(), ive);
         throw ive;
       } else {
         LOG.info(messagePrefix +
@@ -1528,7 +1534,7 @@ class NameNodeRpcServer implements NamenodeProtocols {
   }
 
   @Override // ClientProtocol
-  public EventsList getEditsFromTxid(long txid) throws IOException {
+  public EventBatchList getEditsFromTxid(long txid) throws IOException {
     namesystem.checkOperation(OperationCategory.READ); // only active
     namesystem.checkSuperuserPrivilege();
     int maxEventsPerRPC = nn.conf.getInt(
@@ -1546,13 +1552,14 @@ class NameNodeRpcServer implements NamenodeProtocols {
     // guaranteed to have been written by this NameNode.)
     boolean readInProgress = syncTxid > 0;
 
-    List<Event> events = Lists.newArrayList();
+    List<EventBatch> batches = Lists.newArrayList();
+    int totalEvents = 0;
     long maxSeenTxid = -1;
     long firstSeenTxid = -1;
 
     if (syncTxid > 0 && txid > syncTxid) {
       // we can't read past syncTxid, so there's no point in going any further
-      return new EventsList(events, firstSeenTxid, maxSeenTxid, syncTxid);
+      return new EventBatchList(batches, firstSeenTxid, maxSeenTxid, syncTxid);
     }
 
     Collection<EditLogInputStream> streams = null;
@@ -1564,7 +1571,7 @@ class NameNodeRpcServer implements NamenodeProtocols {
       // will result
       LOG.info("NN is transitioning from active to standby and FSEditLog " +
       "is closed -- could not read edits");
-      return new EventsList(events, firstSeenTxid, maxSeenTxid, syncTxid);
+      return new EventBatchList(batches, firstSeenTxid, maxSeenTxid, syncTxid);
     }
 
     boolean breakOuter = false;
@@ -1582,9 +1589,10 @@ class NameNodeRpcServer implements NamenodeProtocols {
             break;
           }
 
-          Event[] eventsFromOp = InotifyFSEditLogOpTranslator.translate(op);
-          if (eventsFromOp != null) {
-            events.addAll(Arrays.asList(eventsFromOp));
+          EventBatch eventBatch = InotifyFSEditLogOpTranslator.translate(op);
+          if (eventBatch != null) {
+            batches.add(eventBatch);
+            totalEvents += eventBatch.getEvents().length;
           }
           if (op.getTransactionId() > maxSeenTxid) {
             maxSeenTxid = op.getTransactionId();
@@ -1592,7 +1600,7 @@ class NameNodeRpcServer implements NamenodeProtocols {
           if (firstSeenTxid == -1) {
             firstSeenTxid = op.getTransactionId();
           }
-          if (events.size() >= maxEventsPerRPC || (syncTxid > 0 &&
+          if (totalEvents >= maxEventsPerRPC || (syncTxid > 0 &&
               op.getTransactionId() == syncTxid)) {
             // we're done
             breakOuter = true;
@@ -1607,7 +1615,7 @@ class NameNodeRpcServer implements NamenodeProtocols {
       }
     }
 
-    return new EventsList(events, firstSeenTxid, maxSeenTxid, syncTxid);
+    return new EventBatchList(batches, firstSeenTxid, maxSeenTxid, syncTxid);
   }
 
   @Override

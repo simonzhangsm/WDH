@@ -41,7 +41,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
@@ -49,6 +49,7 @@ import org.apache.hadoop.fs.ByteBufferReadable;
 import org.apache.hadoop.fs.ByteBufferUtil;
 import org.apache.hadoop.fs.CanSetDropBehind;
 import org.apache.hadoop.fs.CanSetReadahead;
+import org.apache.hadoop.fs.CanUnbuffer;
 import org.apache.hadoop.fs.ChecksumException;
 import org.apache.hadoop.fs.FSInputStream;
 import org.apache.hadoop.fs.HasEnhancedByteBufferAccess;
@@ -83,24 +84,39 @@ import com.google.common.annotations.VisibleForTesting;
 @InterfaceAudience.Private
 public class DFSInputStream extends FSInputStream
 implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
-    HasEnhancedByteBufferAccess {
+    HasEnhancedByteBufferAccess, CanUnbuffer {
   @VisibleForTesting
   public static boolean tcpReadsDisabledForTesting = false;
   private long hedgedReadOpsLoopNumForTesting = 0;
   private final DFSClient dfsClient;
-  private boolean closed = false;
+  private AtomicBoolean closed = new AtomicBoolean(false);
   private final String src;
-  private BlockReader blockReader = null;
   private final boolean verifyChecksum;
-  private LocatedBlocks locatedBlocks = null;
-  private long lastBlockBeingWrittenLength = 0;
-  private FileEncryptionInfo fileEncryptionInfo = null;
+
+  // state by stateful read only:
+  // (protected by lock on this)
+  /////
   private DatanodeInfo currentNode = null;
   private LocatedBlock currentLocatedBlock = null;
   private long pos = 0;
   private long blockEnd = -1;
+  private BlockReader blockReader = null;
+  ////
+
+  // state shared by stateful and positional read:
+  // (protected by lock on infoLock)
+  ////
+  private LocatedBlocks locatedBlocks = null;
+  private long lastBlockBeingWrittenLength = 0;
+  private FileEncryptionInfo fileEncryptionInfo = null;
   private CachingStrategy cachingStrategy;
+  ////
+
   private final ReadStatistics readStatistics = new ReadStatistics();
+  // lock for state shared between read and pread
+  // Note: Never acquire a lock on <this> with this lock held to avoid deadlocks
+  //       (it's OK to acquire this lock when the lock on <this> is held)
+  private final Object infoLock = new Object();
 
   /**
    * Track the ByteBuffers that we have handed out to readers.
@@ -108,15 +124,19 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * The value type can be either ByteBufferPool or ClientMmap, depending on
    * whether we this is a memory-mapped buffer or not.
    */
-  private final IdentityHashStore<ByteBuffer, Object>
+  private IdentityHashStore<ByteBuffer, Object> extendedReadBuffers;
+
+  private synchronized IdentityHashStore<ByteBuffer, Object>
+        getExtendedReadBuffers() {
+    if (extendedReadBuffers == null) {
       extendedReadBuffers = new IdentityHashStore<ByteBuffer, Object>(0);
+    }
+    return extendedReadBuffers;
+  }
 
   public static class ReadStatistics {
     public ReadStatistics() {
-      this.totalBytesRead = 0;
-      this.totalLocalBytesRead = 0;
-      this.totalShortCircuitBytesRead = 0;
-      this.totalZeroCopyBytesRead = 0;
+      clear();
     }
 
     public ReadStatistics(ReadStatistics rhs) {
@@ -185,6 +205,13 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       this.totalShortCircuitBytesRead += amt;
       this.totalZeroCopyBytesRead += amt;
     }
+
+    void clear() {
+      this.totalBytesRead = 0;
+      this.totalLocalBytesRead = 0;
+      this.totalShortCircuitBytesRead = 0;
+      this.totalZeroCopyBytesRead = 0;
+    }
     
     private long totalBytesRead;
 
@@ -212,49 +239,50 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * parallel accesses to DFSInputStream (through ptreads) properly */
   private final ConcurrentHashMap<DatanodeInfo, DatanodeInfo> deadNodes =
              new ConcurrentHashMap<DatanodeInfo, DatanodeInfo>();
-  private int buffersize = 1;
-  
-  private final byte[] oneByteBuf = new byte[1]; // used for 'int read()'
+
+  private byte[] oneByteBuf; // used for 'int read()'
 
   void addToDeadNodes(DatanodeInfo dnInfo) {
     deadNodes.put(dnInfo, dnInfo);
   }
   
-  DFSInputStream(DFSClient dfsClient, String src, int buffersize, boolean verifyChecksum
+  DFSInputStream(DFSClient dfsClient, String src, boolean verifyChecksum
                  ) throws IOException, UnresolvedLinkException {
     this.dfsClient = dfsClient;
     this.verifyChecksum = verifyChecksum;
-    this.buffersize = buffersize;
     this.src = src;
-    this.cachingStrategy =
-        dfsClient.getDefaultReadCachingStrategy();
+    synchronized (infoLock) {
+      this.cachingStrategy = dfsClient.getDefaultReadCachingStrategy();
+    }
     openInfo();
   }
 
   /**
    * Grab the open-file info from namenode
    */
-  synchronized void openInfo() throws IOException, UnresolvedLinkException {
-    lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
-    int retriesForLastBlockLength = dfsClient.getConf().retryTimesForGetLastBlockLength;
-    while (retriesForLastBlockLength > 0) {
-      // Getting last block length as -1 is a special case. When cluster
-      // restarts, DNs may not report immediately. At this time partial block
-      // locations will not be available with NN for getting the length. Lets
-      // retry for 3 times to get the length.
-      if (lastBlockBeingWrittenLength == -1) {
-        DFSClient.LOG.warn("Last block locations not available. "
-            + "Datanodes might not have reported blocks completely."
-            + " Will retry for " + retriesForLastBlockLength + " times");
-        waitFor(dfsClient.getConf().retryIntervalForGetLastBlockLength);
-        lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
-      } else {
-        break;
+  void openInfo() throws IOException, UnresolvedLinkException {
+    synchronized(infoLock) {
+      lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
+      int retriesForLastBlockLength = dfsClient.getConf().retryTimesForGetLastBlockLength;
+      while (retriesForLastBlockLength > 0) {
+        // Getting last block length as -1 is a special case. When cluster
+        // restarts, DNs may not report immediately. At this time partial block
+        // locations will not be available with NN for getting the length. Lets
+        // retry for 3 times to get the length.
+        if (lastBlockBeingWrittenLength == -1) {
+          DFSClient.LOG.warn("Last block locations not available. "
+              + "Datanodes might not have reported blocks completely."
+              + " Will retry for " + retriesForLastBlockLength + " times");
+          waitFor(dfsClient.getConf().retryIntervalForGetLastBlockLength);
+          lastBlockBeingWrittenLength = fetchLocatedBlocksAndGetLastBlockLength();
+        } else {
+          break;
+        }
+        retriesForLastBlockLength--;
       }
-      retriesForLastBlockLength--;
-    }
-    if (retriesForLastBlockLength == 0) {
-      throw new IOException("Could not obtain the last block locations.");
+      if (retriesForLastBlockLength == 0) {
+        throw new IOException("Could not obtain the last block locations.");
+      }
     }
   }
 
@@ -306,7 +334,6 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
 
     fileEncryptionInfo = locatedBlocks.getFileEncryptionInfo();
 
-    currentNode = null;
     return lastBlockBeingWrittenLength;
   }
 
@@ -359,21 +386,25 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     throw new IOException("Cannot obtain block length for " + locatedblock);
   }
   
-  public synchronized long getFileLength() {
-    return locatedBlocks == null? 0:
-        locatedBlocks.getFileLength() + lastBlockBeingWrittenLength;
+  public long getFileLength() {
+    synchronized(infoLock) {
+      return locatedBlocks == null? 0:
+          locatedBlocks.getFileLength() + lastBlockBeingWrittenLength;
+    }
   }
 
   // Short circuit local reads are forbidden for files that are
   // under construction.  See HDFS-2757.
-  synchronized boolean shortCircuitForbidden() {
-    return locatedBlocks.isUnderConstruction();
+  boolean shortCircuitForbidden() {
+    synchronized(infoLock) {
+      return locatedBlocks.isUnderConstruction();
+    }
   }
 
   /**
    * Returns the datanode from which the stream is currently reading.
    */
-  public DatanodeInfo getCurrentDatanode() {
+  public synchronized DatanodeInfo getCurrentDatanode() {
     return currentNode;
   }
 
@@ -390,7 +421,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
   /**
    * Return collection of blocks that has already been located.
    */
-  public synchronized List<LocatedBlock> getAllBlocks() throws IOException {
+  public List<LocatedBlock> getAllBlocks() throws IOException {
     return getBlockRange(0, getFileLength());
   }
 
@@ -403,59 +434,67 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * @return located block
    * @throws IOException
    */
-  private synchronized LocatedBlock getBlockAt(long offset,
+  private LocatedBlock getBlockAt(long offset,
       boolean updatePosition) throws IOException {
-    assert (locatedBlocks != null) : "locatedBlocks is null";
+    synchronized(infoLock) {
+      assert (locatedBlocks != null) : "locatedBlocks is null";
 
-    final LocatedBlock blk;
+      final LocatedBlock blk;
 
-    //check offset
-    if (offset < 0 || offset >= getFileLength()) {
-      throw new IOException("offset < 0 || offset >= getFileLength(), offset="
-          + offset
-          + ", updatePosition=" + updatePosition
-          + ", locatedBlocks=" + locatedBlocks);
-    }
-    else if (offset >= locatedBlocks.getFileLength()) {
-      // offset to the portion of the last block,
-      // which is not known to the name-node yet;
-      // getting the last block 
-      blk = locatedBlocks.getLastLocatedBlock();
-    }
-    else {
-      // search cached blocks first
-      int targetBlockIdx = locatedBlocks.findBlock(offset);
-      if (targetBlockIdx < 0) { // block is not cached
-        targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
-        // fetch more blocks
-        final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
-        assert (newBlocks != null) : "Could not find target position " + offset;
-        locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+      //check offset
+      if (offset < 0 || offset >= getFileLength()) {
+        throw new IOException("offset < 0 || offset >= getFileLength(), offset="
+            + offset
+            + ", updatePosition=" + updatePosition
+            + ", locatedBlocks=" + locatedBlocks);
       }
-      blk = locatedBlocks.get(targetBlockIdx);
-    }
+      else if (offset >= locatedBlocks.getFileLength()) {
+        // offset to the portion of the last block,
+        // which is not known to the name-node yet;
+        // getting the last block
+        blk = locatedBlocks.getLastLocatedBlock();
+      }
+      else {
+        // search cached blocks first
+        int targetBlockIdx = locatedBlocks.findBlock(offset);
+        if (targetBlockIdx < 0) { // block is not cached
+          targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
+          // fetch more blocks
+          final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+          assert (newBlocks != null) : "Could not find target position " + offset;
+          locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
+        }
+        blk = locatedBlocks.get(targetBlockIdx);
+      }
 
-    // update current position
-    if (updatePosition) {
-      pos = offset;
-      blockEnd = blk.getStartOffset() + blk.getBlockSize() - 1;
-      currentLocatedBlock = blk;
+      // update current position
+      if (updatePosition) {
+        // synchronized not strictly needed, since we only get here
+        // from synchronized caller methods
+        synchronized(this) {
+          pos = offset;
+          blockEnd = blk.getStartOffset() + blk.getBlockSize() - 1;
+          currentLocatedBlock = blk;
+        }
+      }
+      return blk;
     }
-    return blk;
   }
 
   /** Fetch a block from namenode and cache it */
-  private synchronized void fetchBlockAt(long offset) throws IOException {
-    int targetBlockIdx = locatedBlocks.findBlock(offset);
-    if (targetBlockIdx < 0) { // block is not cached
-      targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
+  private void fetchBlockAt(long offset) throws IOException {
+    synchronized(infoLock) {
+      int targetBlockIdx = locatedBlocks.findBlock(offset);
+      if (targetBlockIdx < 0) { // block is not cached
+        targetBlockIdx = LocatedBlocks.getInsertIndex(targetBlockIdx);
+      }
+      // fetch blocks
+      final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
+      if (newBlocks == null) {
+        throw new IOException("Could not find target position " + offset);
+      }
+      locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
     }
-    // fetch blocks
-    final LocatedBlocks newBlocks = dfsClient.getLocatedBlocks(src, offset);
-    if (newBlocks == null) {
-      throw new IOException("Could not find target position " + offset);
-    }
-    locatedBlocks.insertRange(targetBlockIdx, newBlocks.getLocatedBlocks());
   }
 
   /**
@@ -467,7 +506,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * @return consequent segment of located blocks
    * @throws IOException
    */
-  private synchronized List<LocatedBlock> getBlockRange(long offset,
+  private List<LocatedBlock> getBlockRange(long offset,
       long length)  throws IOException {
     // getFileLength(): returns total file length
     // locatedBlocks.getFileLength(): returns length of completed blocks
@@ -475,26 +514,27 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       throw new IOException("Offset: " + offset +
         " exceeds file length: " + getFileLength());
     }
+    synchronized(infoLock) {
+      final List<LocatedBlock> blocks;
+      final long lengthOfCompleteBlk = locatedBlocks.getFileLength();
+      final boolean readOffsetWithinCompleteBlk = offset < lengthOfCompleteBlk;
+      final boolean readLengthPastCompleteBlk = offset + length > lengthOfCompleteBlk;
 
-    final List<LocatedBlock> blocks;
-    final long lengthOfCompleteBlk = locatedBlocks.getFileLength();
-    final boolean readOffsetWithinCompleteBlk = offset < lengthOfCompleteBlk;
-    final boolean readLengthPastCompleteBlk = offset + length > lengthOfCompleteBlk;
+      if (readOffsetWithinCompleteBlk) {
+        //get the blocks of finalized (completed) block range
+        blocks = getFinalizedBlockRange(offset,
+          Math.min(length, lengthOfCompleteBlk - offset));
+      } else {
+        blocks = new ArrayList<LocatedBlock>(1);
+      }
 
-    if (readOffsetWithinCompleteBlk) {
-      //get the blocks of finalized (completed) block range
-      blocks = getFinalizedBlockRange(offset, 
-        Math.min(length, lengthOfCompleteBlk - offset));
-    } else {
-      blocks = new ArrayList<LocatedBlock>(1);
+      // get the blocks from incomplete block range
+      if (readLengthPastCompleteBlk) {
+         blocks.add(locatedBlocks.getLastLocatedBlock());
+      }
+
+      return blocks;
     }
-
-    // get the blocks from incomplete block range
-    if (readLengthPastCompleteBlk) {
-       blocks.add(locatedBlocks.getLastLocatedBlock());
-    }
-
-    return blocks;
   }
 
   /**
@@ -502,35 +542,37 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * Includes only the complete blocks.
    * Fetch them from the namenode if not cached.
    */
-  private synchronized List<LocatedBlock> getFinalizedBlockRange(
+  private List<LocatedBlock> getFinalizedBlockRange(
       long offset, long length) throws IOException {
-    assert (locatedBlocks != null) : "locatedBlocks is null";
-    List<LocatedBlock> blockRange = new ArrayList<LocatedBlock>();
-    // search cached blocks first
-    int blockIdx = locatedBlocks.findBlock(offset);
-    if (blockIdx < 0) { // block is not cached
-      blockIdx = LocatedBlocks.getInsertIndex(blockIdx);
-    }
-    long remaining = length;
-    long curOff = offset;
-    while(remaining > 0) {
-      LocatedBlock blk = null;
-      if(blockIdx < locatedBlocks.locatedBlockCount())
-        blk = locatedBlocks.get(blockIdx);
-      if (blk == null || curOff < blk.getStartOffset()) {
-        LocatedBlocks newBlocks;
-        newBlocks = dfsClient.getLocatedBlocks(src, curOff, remaining);
-        locatedBlocks.insertRange(blockIdx, newBlocks.getLocatedBlocks());
-        continue;
+    synchronized(infoLock) {
+      assert (locatedBlocks != null) : "locatedBlocks is null";
+      List<LocatedBlock> blockRange = new ArrayList<LocatedBlock>();
+      // search cached blocks first
+      int blockIdx = locatedBlocks.findBlock(offset);
+      if (blockIdx < 0) { // block is not cached
+        blockIdx = LocatedBlocks.getInsertIndex(blockIdx);
       }
-      assert curOff >= blk.getStartOffset() : "Block not found";
-      blockRange.add(blk);
-      long bytesRead = blk.getStartOffset() + blk.getBlockSize() - curOff;
-      remaining -= bytesRead;
-      curOff += bytesRead;
-      blockIdx++;
+      long remaining = length;
+      long curOff = offset;
+      while(remaining > 0) {
+        LocatedBlock blk = null;
+        if(blockIdx < locatedBlocks.locatedBlockCount())
+          blk = locatedBlocks.get(blockIdx);
+        if (blk == null || curOff < blk.getStartOffset()) {
+          LocatedBlocks newBlocks;
+          newBlocks = dfsClient.getLocatedBlocks(src, curOff, remaining);
+          locatedBlocks.insertRange(blockIdx, newBlocks.getLocatedBlocks());
+          continue;
+        }
+        assert curOff >= blk.getStartOffset() : "Block not found";
+        blockRange.add(blk);
+        long bytesRead = blk.getStartOffset() + blk.getBlockSize() - curOff;
+        remaining -= bytesRead;
+        curOff += bytesRead;
+        blockIdx++;
+      }
+      return blockRange;
     }
-    return blockRange;
   }
 
   /**
@@ -543,10 +585,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     }
 
     // Will be getting a new BlockReader.
-    if (blockReader != null) {
-      blockReader.close();
-      blockReader = null;
-    }
+    closeCurrentBlockReader();
 
     //
     // Connect to best DataNode for desired Block, with potential offset
@@ -573,6 +612,12 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       try {
         ExtendedBlock blk = targetBlock.getBlock();
         Token<BlockTokenIdentifier> accessToken = targetBlock.getBlockToken();
+        CachingStrategy curCachingStrategy;
+        boolean shortCircuitForbidden;
+        synchronized(infoLock) {
+          curCachingStrategy = cachingStrategy;
+          shortCircuitForbidden = shortCircuitForbidden();
+        }
         blockReader = new BlockReaderFactory(dfsClient.getConf()).
             setInetSocketAddress(targetAddr).
             setRemotePeerFactory(dfsClient).
@@ -585,8 +630,8 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
             setVerifyChecksum(verifyChecksum).
             setClientName(dfsClient.clientName).
             setLength(blk.getNumBytes() - offsetIntoBlock).
-            setCachingStrategy(cachingStrategy).
-            setAllowShortCircuitLocalReads(!shortCircuitForbidden()).
+            setCachingStrategy(curCachingStrategy).
+            setAllowShortCircuitLocalReads(!shortCircuitForbidden).
             setClientCacheContext(dfsClient.getClientContext()).
             setUserGroupInformation(dfsClient.ugi).
             setConfiguration(dfsClient.getConfiguration()).
@@ -623,12 +668,13 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    */
   @Override
   public synchronized void close() throws IOException {
-    if (closed) {
+    if (!closed.compareAndSet(false, true)) {
+      DFSClient.LOG.warn("DFSInputStream has been closed already");
       return;
     }
     dfsClient.checkOpen();
 
-    if (!extendedReadBuffers.isEmpty()) {
+    if ((extendedReadBuffers != null) && (!extendedReadBuffers.isEmpty())) {
       final StringBuilder builder = new StringBuilder();
       extendedReadBuffers.visitAll(new IdentityHashStore.Visitor<ByteBuffer, Object>() {
         private String prefix = "";
@@ -642,16 +688,15 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
           "unreleased ByteBuffers allocated by read().  " +
           "Please release " + builder.toString() + ".");
     }
-    if (blockReader != null) {
-      blockReader.close();
-      blockReader = null;
-    }
+    closeCurrentBlockReader();
     super.close();
-    closed = true;
   }
 
   @Override
   public synchronized int read() throws IOException {
+    if (oneByteBuf == null) {
+      oneByteBuf = new byte[1];
+    }
     int ret = read( oneByteBuf, 0, 1 );
     return ( ret <= 0 ) ? -1 : (oneByteBuf[0] & 0xff);
   }
@@ -661,26 +706,28 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * strategy-agnostic.
    */
   private interface ReaderStrategy {
-    public int doRead(BlockReader blockReader, int off, int len,
-        ReadStatistics readStatistics) throws ChecksumException, IOException;
+    public int doRead(BlockReader blockReader, int off, int len)
+        throws ChecksumException, IOException;
   }
 
-  private static void updateReadStatistics(ReadStatistics readStatistics, 
+  private void updateReadStatistics(ReadStatistics readStatistics, 
         int nRead, BlockReader blockReader) {
     if (nRead <= 0) return;
-    if (blockReader.isShortCircuit()) {
-      readStatistics.addShortCircuitBytes(nRead);
-    } else if (blockReader.isLocal()) {
-      readStatistics.addLocalBytes(nRead);
-    } else {
-      readStatistics.addRemoteBytes(nRead);
+    synchronized(infoLock) {
+      if (blockReader.isShortCircuit()) {
+        readStatistics.addShortCircuitBytes(nRead);
+      } else if (blockReader.isLocal()) {
+        readStatistics.addLocalBytes(nRead);
+      } else {
+        readStatistics.addRemoteBytes(nRead);
+      }
     }
   }
   
   /**
    * Used to read bytes into a byte[]
    */
-  private static class ByteArrayStrategy implements ReaderStrategy {
+  private class ByteArrayStrategy implements ReaderStrategy {
     final byte[] buf;
 
     public ByteArrayStrategy(byte[] buf) {
@@ -688,26 +735,26 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     }
 
     @Override
-    public int doRead(BlockReader blockReader, int off, int len,
-            ReadStatistics readStatistics) throws ChecksumException, IOException {
-        int nRead = blockReader.read(buf, off, len);
-        updateReadStatistics(readStatistics, nRead, blockReader);
-        return nRead;
+    public int doRead(BlockReader blockReader, int off, int len)
+          throws ChecksumException, IOException {
+      int nRead = blockReader.read(buf, off, len);
+      updateReadStatistics(readStatistics, nRead, blockReader);
+      return nRead;
     }
   }
 
   /**
    * Used to read bytes into a user-supplied ByteBuffer
    */
-  private static class ByteBufferStrategy implements ReaderStrategy {
+  private class ByteBufferStrategy implements ReaderStrategy {
     final ByteBuffer buf;
     ByteBufferStrategy(ByteBuffer buf) {
       this.buf = buf;
     }
 
     @Override
-    public int doRead(BlockReader blockReader, int off, int len,
-        ReadStatistics readStatistics) throws ChecksumException, IOException {
+    public int doRead(BlockReader blockReader, int off, int len)
+        throws ChecksumException, IOException {
       int oldpos = buf.position();
       int oldlimit = buf.limit();
       boolean success = false;
@@ -746,7 +793,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     while (true) {
       // retry as many times as seekToNewSource allows.
       try {
-        return reader.doRead(blockReader, off, len, readStatistics);
+        return reader.doRead(blockReader, off, len);
       } catch ( ChecksumException ce ) {
         DFSClient.LOG.warn("Found Checksum error for "
             + getCurrentBlock() + " from " + currentNode
@@ -782,9 +829,9 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     }
   }
 
-  private int readWithStrategy(ReaderStrategy strategy, int off, int len) throws IOException {
+  private synchronized int readWithStrategy(ReaderStrategy strategy, int off, int len) throws IOException {
     dfsClient.checkOpen();
-    if (closed) {
+    if (closed.get()) {
       throw new IOException("Stream closed");
     }
     Map<ExtendedBlock,Set<DatanodeInfo>> corruptedBlockMap 
@@ -800,8 +847,11 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
             currentNode = blockSeekTo(pos);
           }
           int realLen = (int) Math.min(len, (blockEnd - pos + 1L));
-          if (locatedBlocks.isLastBlockComplete()) {
-            realLen = (int) Math.min(realLen, locatedBlocks.getFileLength());
+          synchronized(infoLock) {
+            if (locatedBlocks.isLastBlockComplete()) {
+              realLen = (int) Math.min(realLen,
+                  locatedBlocks.getFileLength() - pos);
+            }
           }
           int result = readBuffer(strategy, off, realLen, corruptedBlockMap);
           
@@ -1036,8 +1086,8 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       // start of the loop.
       CachingStrategy curCachingStrategy;
       boolean allowShortCircuitLocalReads;
-      synchronized (this) {
-        block = getBlockAt(block.getStartOffset(), false);
+      block = getBlockAt(block.getStartOffset(), false);
+      synchronized(infoLock) {
         curCachingStrategy = cachingStrategy;
         allowShortCircuitLocalReads = !shortCircuitForbidden();
       }
@@ -1302,7 +1352,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     throws IOException {
     // sanity checks
     dfsClient.checkOpen();
-    if (closed) {
+    if (closed.get()) {
       throw new IOException("Stream closed");
     }
     failures = 0;
@@ -1411,7 +1461,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     if (targetPos < 0) {
       throw new EOFException("Cannot seek to negative offset");
     }
-    if (closed) {
+    if (closed.get()) {
       throw new IOException("Stream is closed!");
     }
     boolean done = false;
@@ -1455,7 +1505,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    * Same as {@link #seekToNewSource(long)} except that it does not exclude
    * the current datanode and might connect to the same node.
    */
-  private synchronized boolean seekToBlockSource(long targetPos)
+  private boolean seekToBlockSource(long targetPos)
                                                  throws IOException {
     currentNode = blockSeekTo(targetPos);
     return true;
@@ -1498,7 +1548,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
    */
   @Override
   public synchronized int available() throws IOException {
-    if (closed) {
+    if (closed.get()) {
       throw new IOException("Stream closed");
     }
 
@@ -1538,15 +1588,28 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
   /**
    * Get statistics about the reads which this DFSInputStream has done.
    */
-  public synchronized ReadStatistics getReadStatistics() {
-    return new ReadStatistics(readStatistics);
+  public ReadStatistics getReadStatistics() {
+    synchronized(infoLock) {
+      return new ReadStatistics(readStatistics);
+    }
   }
 
-  public synchronized FileEncryptionInfo getFileEncryptionInfo() {
-    return fileEncryptionInfo;
+  /**
+   * Clear statistics about the reads which this DFSInputStream has done.
+   */
+  public void clearReadStatistics() {
+    synchronized(infoLock) {
+      readStatistics.clear();
+    }
   }
 
-  private synchronized void closeCurrentBlockReader() {
+  public FileEncryptionInfo getFileEncryptionInfo() {
+    synchronized(infoLock) {
+      return fileEncryptionInfo;
+    }
+  }
+
+  private void closeCurrentBlockReader() {
     if (blockReader == null) return;
     // Close the current block reader so that the new caching settings can 
     // take effect immediately.
@@ -1556,23 +1619,26 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       DFSClient.LOG.error("error closing blockReader", e);
     }
     blockReader = null;
+    blockEnd = -1;
   }
 
   @Override
   public synchronized void setReadahead(Long readahead)
       throws IOException {
-    this.cachingStrategy =
-        new CachingStrategy.Builder(this.cachingStrategy).
-            setReadahead(readahead).build();
+    synchronized (infoLock) {
+      this.cachingStrategy =
+          new CachingStrategy.Builder(this.cachingStrategy).setReadahead(readahead).build();
+    }
     closeCurrentBlockReader();
   }
 
   @Override
   public synchronized void setDropBehind(Boolean dropBehind)
       throws IOException {
-    this.cachingStrategy =
-        new CachingStrategy.Builder(this.cachingStrategy).
-            setDropBehind(dropBehind).build();
+    synchronized (infoLock) {
+      this.cachingStrategy =
+          new CachingStrategy.Builder(this.cachingStrategy).setDropBehind(dropBehind).build();
+    }
     closeCurrentBlockReader();
   }
 
@@ -1617,7 +1683,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     }
     buffer = ByteBufferUtil.fallbackRead(this, bufferPool, maxLength);
     if (buffer != null) {
-      extendedReadBuffers.put(buffer, bufferPool);
+      getExtendedReadBuffers().put(buffer, bufferPool);
     }
     return buffer;
   }
@@ -1696,8 +1762,10 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
       buffer = clientMmap.getMappedByteBuffer().asReadOnlyBuffer();
       buffer.position((int)blockPos);
       buffer.limit((int)(blockPos + length));
-      extendedReadBuffers.put(buffer, clientMmap);
-      readStatistics.addZeroCopyBytes(length);
+      getExtendedReadBuffers().put(buffer, clientMmap);
+      synchronized (infoLock) {
+        readStatistics.addZeroCopyBytes(length);
+      }
       if (DFSClient.LOG.isDebugEnabled()) {
         DFSClient.LOG.debug("readZeroCopy read " + length + 
             " bytes from offset " + curPos + " via the zero-copy read " +
@@ -1715,7 +1783,7 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
   @Override
   public synchronized void releaseBuffer(ByteBuffer buffer) {
     if (buffer == EMPTY_BUFFER) return;
-    Object val = extendedReadBuffers.remove(buffer);
+    Object val = getExtendedReadBuffers().remove(buffer);
     if (val == null) {
       throw new IllegalArgumentException("tried to release a buffer " +
           "that was not created by this stream, " + buffer);
@@ -1725,5 +1793,10 @@ implements ByteBufferReadable, CanSetDropBehind, CanSetReadahead,
     } else if (val instanceof ByteBufferPool) {
       ((ByteBufferPool)val).putBuffer(buffer);
     }
+  }
+
+  @Override
+  public synchronized void unbuffer() {
+    closeCurrentBlockReader();
   }
 }

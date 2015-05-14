@@ -43,7 +43,7 @@ import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
-import org.apache.hadoop.hdfs.inotify.EventsList;
+import org.apache.hadoop.hdfs.inotify.EventBatchList;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants.RollingUpgradeAction;
 import org.apache.hadoop.hdfs.security.token.block.DataEncryptionKey;
 import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifier;
@@ -652,6 +652,7 @@ public interface ClientProtocol {
   public int GET_STATS_UNDER_REPLICATED_IDX = 3;
   public int GET_STATS_CORRUPT_BLOCKS_IDX = 4;
   public int GET_STATS_MISSING_BLOCKS_IDX = 5;
+  public int GET_STATS_MISSING_REPL_ONE_BLOCKS_IDX = 6;
   
   /**
    * Get a set of statistics about the filesystem.
@@ -663,7 +664,8 @@ public interface ClientProtocol {
    * <li> [3] contains number of under replicated blocks in the system.</li>
    * <li> [4] contains number of blocks with a corrupt replica. </li>
    * <li> [5] contains number of blocks without any good replicas left. </li>
-   * <li> [6] contains the total used space of the block pool. </li>
+   * <li> [6] contains number of blocks which have replication factor
+   *          1 and have lost the only replica. </li>
    * </ul>
    * Use public constants like {@link #GET_STATS_CAPACITY_IDX} in place of 
    * actual numbers to index into the array.
@@ -1405,9 +1407,9 @@ public interface ClientProtocol {
   public long getCurrentEditLogTxid() throws IOException;
 
   /**
-   * Get an ordered list of events corresponding to the edit log transactions
-   * from txid onwards.
+   * Get an ordered list of batches of events corresponding to the edit log
+   * transactions for txids equal to or greater than txid.
    */
   @Idempotent
-  public EventsList getEditsFromTxid(long txid) throws IOException;
+  public EventBatchList getEditsFromTxid(long txid) throws IOException;
 }

@@ -63,6 +63,7 @@ import org.apache.hadoop.hdfs.server.datanode.DataNodeLayoutVersion;
 import org.apache.hadoop.hdfs.server.datanode.TestTransferRbw;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.FsDatasetSpi;
 import org.apache.hadoop.hdfs.server.namenode.FSNamesystem;
+import org.apache.hadoop.hdfs.server.namenode.LeaseManager;
 import org.apache.hadoop.hdfs.server.namenode.NameNode;
 import org.apache.hadoop.hdfs.server.namenode.ha
         .ConfiguredFailoverProxyProvider;
@@ -81,6 +82,7 @@ import org.apache.hadoop.test.GenericTestUtils;
 import org.apache.hadoop.util.StringUtils;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.VersionInfo;
+import org.apache.log4j.Level;
 import org.junit.Assume;
 
 import java.io.*;
@@ -271,7 +273,7 @@ public class DFSTestUtil {
     try {
       FSDataInputStream in = fs.open(fileName);
       try {
-        IOUtils.copyBytes(fs.open(fileName), os, 1024, true);
+        IOUtils.copyBytes(in, os, 1024, true);
         return os.toByteArray();
       } finally {
         in.close();
@@ -704,11 +706,6 @@ public class DFSTestUtil {
   public static Token<BlockTokenIdentifier> getBlockToken(
       FSDataOutputStream out) {
     return ((DFSOutputStream) out.getWrappedStream()).getBlockToken();
-  }
-
-  static void setLogLevel2All(org.apache.commons.logging.Log log) {
-    ((org.apache.commons.logging.impl.Log4JLogger)log
-        ).getLogger().setLevel(org.apache.log4j.Level.ALL);
   }
 
   public static String readFile(File f) throws IOException {
@@ -1635,5 +1632,49 @@ public class DFSTestUtil {
     // Update the FEATURES map with the new layout version.
     LayoutVersion.updateMap(DataNodeLayoutVersion.FEATURES,
                             new LayoutVersion.LayoutFeature[] { feature });
+  }
+
+  /**
+   * Wait for datanode to reach alive or dead state for waitTime given in
+   * milliseconds.
+   */
+  public static void waitForDatanodeState(
+      final MiniDFSCluster cluster, final String nodeID,
+      final boolean alive, int waitTime)
+      throws TimeoutException, InterruptedException {
+    GenericTestUtils.waitFor(new Supplier<Boolean>() {
+      @Override
+      public Boolean get() {
+        FSNamesystem namesystem = cluster.getNamesystem();
+        final DatanodeDescriptor dd = BlockManagerTestUtil.getDatanode(
+            namesystem, nodeID);
+        return (dd.isAlive == alive);
+      }
+    }, 100, waitTime);
+  }
+
+  public static void setNameNodeLogLevel(Level level) {
+    GenericTestUtils.setLogLevel(FSNamesystem.LOG, level);
+    GenericTestUtils.setLogLevel(BlockManager.LOG, level);
+    GenericTestUtils.setLogLevel(LeaseManager.LOG, level);
+    GenericTestUtils.setLogLevel(NameNode.LOG, level);
+    GenericTestUtils.setLogLevel(NameNode.stateChangeLog, level);
+    GenericTestUtils.setLogLevel(NameNode.blockStateChangeLog, level);
+  }
+
+ /**
+   * Change the length of a block at datanode dnIndex
+   */
+  public static boolean changeReplicaLength(MiniDFSCluster cluster,
+      ExtendedBlock blk, int dnIndex, int lenDelta) throws IOException {
+    File blockFile = cluster.getBlockFile(dnIndex, blk);
+    if (blockFile != null && blockFile.exists()) {
+      RandomAccessFile raFile = new RandomAccessFile(blockFile, "rw");
+      raFile.setLength(raFile.length()+lenDelta);
+      raFile.close();
+      return true;
+    }
+    LOG.info("failed to change length of block " + blk);
+    return false;
   }
 }

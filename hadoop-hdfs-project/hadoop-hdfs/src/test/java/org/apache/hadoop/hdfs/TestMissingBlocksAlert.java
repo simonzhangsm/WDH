@@ -17,13 +17,6 @@
  */
 package org.apache.hadoop.hdfs;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
-import java.io.IOException;
-import java.net.URL;
-
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -32,7 +25,15 @@ import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hdfs.protocol.ExtendedBlock;
 import org.apache.hadoop.hdfs.server.blockmanagement.BlockManager;
+import org.junit.Assert;
 import org.junit.Test;
+
+import javax.management.*;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * The test makes sure that NameNode detects presense blocks that do not have
@@ -45,8 +46,11 @@ public class TestMissingBlocksAlert {
                            LogFactory.getLog(TestMissingBlocksAlert.class);
   
   @Test
-  public void testMissingBlocksAlert() throws IOException, 
-                                       InterruptedException {
+  public void testMissingBlocksAlert()
+          throws IOException, InterruptedException,
+                 MalformedObjectNameException, AttributeNotFoundException,
+                 MBeanException, ReflectionException,
+                 InstanceNotFoundException {
     
     MiniDFSCluster cluster = null;
     
@@ -73,10 +77,9 @@ public class TestMissingBlocksAlert {
       Path corruptFile = new Path("/testMissingBlocks/corruptFile");
       DFSTestUtil.createFile(dfs, corruptFile, fileLen, (short)3, 0);
 
-
       // Corrupt the block
       ExtendedBlock block = DFSTestUtil.getFirstBlock(dfs, corruptFile);
-      assertTrue(TestDatanodeBlockScanner.corruptReplica(block, 0));
+      assertTrue(cluster.corruptReplica(0, block));
 
       // read the file so that the corrupt block is reported to NN
       FSDataInputStream in = dfs.open(corruptFile); 
@@ -95,14 +98,11 @@ public class TestMissingBlocksAlert {
       assertEquals(4, dfs.getUnderReplicatedBlocksCount());
       assertEquals(3, bm.getUnderReplicatedNotMissingBlocks());
 
-
-      // Now verify that it shows up on webui
-      URL url = new URL("http://" + conf.get(DFSConfigKeys.DFS_NAMENODE_HTTP_ADDRESS_KEY) + 
-                        "/dfshealth.jsp");
-      String dfsFrontPage = DFSTestUtil.urlGet(url);
-      String warnStr = "WARNING : There are ";
-      assertTrue("HDFS Front page does not contain expected warning", 
-                 dfsFrontPage.contains(warnStr + "1 missing blocks"));
+      MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+      ObjectName mxbeanName = new ObjectName(
+              "Hadoop:service=NameNode,name=NameNodeInfo");
+      Assert.assertEquals(1, (long)(Long) mbs.getAttribute(mxbeanName,
+                      "NumberOfMissingBlocks"));
 
       // now do the reverse : remove the file expect the number of missing 
       // blocks to go to zero
@@ -117,11 +117,25 @@ public class TestMissingBlocksAlert {
       assertEquals(2, dfs.getUnderReplicatedBlocksCount());
       assertEquals(2, bm.getUnderReplicatedNotMissingBlocks());
 
-      // and make sure WARNING disappears
-      // Now verify that it shows up on webui
-      dfsFrontPage = DFSTestUtil.urlGet(url);
-      assertFalse("HDFS Front page contains unexpected warning", 
-                  dfsFrontPage.contains(warnStr));
+      Assert.assertEquals(0, (long)(Long) mbs.getAttribute(mxbeanName,
+              "NumberOfMissingBlocks"));
+
+      Path replOneFile = new Path("/testMissingBlocks/replOneFile");
+      DFSTestUtil.createFile(dfs, replOneFile, fileLen, (short)1, 0);
+      ExtendedBlock replOneBlock = DFSTestUtil.getFirstBlock(
+          dfs, replOneFile);
+      assertTrue(cluster.corruptReplica(0, replOneBlock));
+
+      // read the file so that the corrupt block is reported to NN
+      in = dfs.open(replOneFile);
+      try {
+        in.readFully(new byte[fileLen]);
+      } catch (ChecksumException ignored) { // checksum error is expected.
+      }
+      in.close();
+      assertEquals(1, dfs.getMissingReplOneBlocksCount());
+      Assert.assertEquals(1, (long)(Long) mbs.getAttribute(mxbeanName,
+          "NumberOfMissingBlocksWithReplicationFactorOne"));
     } finally {
       if (cluster != null) {
         cluster.shutdown();

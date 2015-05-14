@@ -20,7 +20,6 @@ package org.apache.hadoop.hdfs.server.namenode;
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.fs.permission.PermissionStatus;
-import org.apache.hadoop.hdfs.protocol.QuotaExceededException;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
 import org.apache.hadoop.hdfs.util.LongBitFormat;
 import org.apache.hadoop.util.LightWeightGSet.LinkedElement;
@@ -162,45 +161,33 @@ public abstract class INodeWithAdditionalFields extends INode
         getFsPermission(snapshotId));
   }
 
-  private final void updatePermissionStatus(PermissionStatusFormat f, long n) {
+  final void updatePermissionStatus(PermissionStatusFormat f, long n) {
     this.permission = f.BITS.combine(n, permission);
   }
 
   @Override
-  final String getUserName(int snapshotId) {
-    if (snapshotId != Snapshot.CURRENT_STATE_ID) {
-      return getSnapshotINode(snapshotId).getUserName();
-    }
-    return PermissionStatusFormat.getUser(permission);
+  public final String getUserName(int snapshotId) {
+    return AuthorizationProvider.get().getUser(this, snapshotId);
   }
 
   @Override
   final void setUser(String user) {
-    int n = SerialNumberManager.INSTANCE.getUserSerialNumber(user);
-    updatePermissionStatus(PermissionStatusFormat.USER, n);
+    AuthorizationProvider.get().setUser(this, user);
   }
 
   @Override
-  final String getGroupName(int snapshotId) {
-    if (snapshotId != Snapshot.CURRENT_STATE_ID) {
-      return getSnapshotINode(snapshotId).getGroupName();
-    }
-    return PermissionStatusFormat.getGroup(permission);
+  public final String getGroupName(int snapshotId) {
+    return AuthorizationProvider.get().getGroup(this, snapshotId);
   }
 
   @Override
   final void setGroup(String group) {
-    int n = SerialNumberManager.INSTANCE.getGroupSerialNumber(group);
-    updatePermissionStatus(PermissionStatusFormat.GROUP, n);
+    AuthorizationProvider.get().setGroup(this, group);
   }
 
   @Override
-  final FsPermission getFsPermission(int snapshotId) {
-    if (snapshotId != Snapshot.CURRENT_STATE_ID) {
-      return getSnapshotINode(snapshotId).getFsPermission();
-    }
-
-    return new FsPermission(getFsPermissionShort());
+  public final FsPermission getFsPermission(int snapshotId) {
+    return AuthorizationProvider.get().getFsPermission(this, snapshotId);
   }
 
   @Override
@@ -209,8 +196,7 @@ public abstract class INodeWithAdditionalFields extends INode
   }
   @Override
   void setPermission(FsPermission permission) {
-    final short mode = permission.toShort();
-    updatePermissionStatus(PermissionStatusFormat.MODE, mode);
+    AuthorizationProvider.get().setPermission(this, permission);
   }
 
   @Override
@@ -219,12 +205,8 @@ public abstract class INodeWithAdditionalFields extends INode
   }
 
   @Override
-  final AclFeature getAclFeature(int snapshotId) {
-    if (snapshotId != Snapshot.CURRENT_STATE_ID) {
-      return getSnapshotINode(snapshotId).getAclFeature();
-    }
-
-    return getFeature(AclFeature.class);
+  public final AclFeature getAclFeature(int snapshotId) {
+    return AuthorizationProvider.get().getAclFeature(this, snapshotId);
   }
 
   @Override
@@ -239,8 +221,7 @@ public abstract class INodeWithAdditionalFields extends INode
 
   /** Update modification time if it is larger than the current value. */
   @Override
-  public final INode updateModificationTime(long mtime, int latestSnapshotId) 
-      throws QuotaExceededException {
+  public final INode updateModificationTime(long mtime, int latestSnapshotId) {
     Preconditions.checkState(isDirectory());
     if (mtime <= modificationTime) {
       return this;
@@ -327,17 +308,11 @@ public abstract class INodeWithAdditionalFields extends INode
   }
 
   public void removeAclFeature() {
-    AclFeature f = getAclFeature();
-    Preconditions.checkNotNull(f);
-    removeFeature(f);
+    AuthorizationProvider.get().removeAclFeature(this);
   }
 
   public void addAclFeature(AclFeature f) {
-    AclFeature f1 = getAclFeature();
-    if (f1 != null)
-      throw new IllegalStateException("Duplicated ACLFeature");
-
-    addFeature(f);
+    AuthorizationProvider.get().addAclFeature(this, f);
   }
   
   @Override

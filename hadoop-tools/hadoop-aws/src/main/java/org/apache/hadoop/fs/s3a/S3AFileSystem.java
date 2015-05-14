@@ -26,6 +26,11 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.amazonaws.AmazonClientException;
 import com.amazonaws.AmazonServiceException;
@@ -69,17 +74,88 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class S3AFileSystem extends FileSystem {
+  /**
+   * Default blocksize as used in blocksize and FS status queries
+   */
+  public static final int DEFAULT_BLOCKSIZE = 32 * 1024 * 1024;
   private URI uri;
   private Path workingDir;
   private AmazonS3Client s3;
   private String bucket;
   private int maxKeys;
   private long partSize;
-  private int partSizeThreshold;
+  private TransferManager transfers;
+  private ThreadPoolExecutor threadPoolExecutor;
+  private int multiPartThreshold;
   public static final Logger LOG = LoggerFactory.getLogger(S3AFileSystem.class);
   private CannedAccessControlList cannedACL;
   private String serverSideEncryptionAlgorithm;
 
+  // The maximum number of entries that can be deleted in any call to s3
+  private static final int MAX_ENTRIES_TO_DELETE = 1000;
+
+  private static final AtomicInteger poolNumber = new AtomicInteger(1);
+
+  // CLOUDERA-BUILD: deprecate access key and secret key introduced in CDH 5.3
+  private static final String DEPRECATED_ACCESS_KEY = "fs.s3a.awsAccessKeyId";
+  private static final String DEPRECATED_SECRET_KEY = "fs.s3a.awsSecretAccessKey";
+
+  static {
+    Configuration.addDeprecation(DEPRECATED_ACCESS_KEY, ACCESS_KEY,
+        String.format("%s is deprecated, use %s instead.",
+            DEPRECATED_ACCESS_KEY, ACCESS_KEY));
+    Configuration.addDeprecation(DEPRECATED_SECRET_KEY, SECRET_KEY,
+        String.format("%s is deprecated, use %s instead.",
+            DEPRECATED_SECRET_KEY, SECRET_KEY));
+  }
+
+  /**
+   * Returns a {@link java.util.concurrent.ThreadFactory} that names each created thread uniquely,
+   * with a common prefix.
+   * @param prefix The prefix of every created Thread's name
+   * @return a {@link java.util.concurrent.ThreadFactory} that names threads
+   */
+  public static ThreadFactory getNamedThreadFactory(final String prefix) {
+    SecurityManager s = System.getSecurityManager();
+    final ThreadGroup threadGroup = (s != null) ? s.getThreadGroup() : Thread.currentThread()
+        .getThreadGroup();
+
+    return new ThreadFactory() {
+      final AtomicInteger threadNumber = new AtomicInteger(1);
+      private final int poolNum = poolNumber.getAndIncrement();
+      final ThreadGroup group = threadGroup;
+
+      @Override
+      public Thread newThread(Runnable r) {
+        final String name = prefix + "-pool" + poolNum + "-t" + threadNumber.getAndIncrement();
+        return new Thread(group, r, name);
+      }
+    };
+  }
+
+  /**
+   * Get a named {@link ThreadFactory} that just builds daemon threads.
+   * @param prefix name prefix for all threads created from the factory
+   * @return a thread factory that creates named, daemon threads with
+   *         the supplied exception handler and normal priority
+   */
+  private static ThreadFactory newDaemonThreadFactory(final String prefix) {
+    final ThreadFactory namedFactory = getNamedThreadFactory(prefix);
+    return new ThreadFactory() {
+      @Override
+      public Thread newThread(Runnable r) {
+        Thread t = namedFactory.newThread(r);
+        if (!t.isDaemon()) {
+          t.setDaemon(true);
+        }
+        if (t.getPriority() != Thread.NORM_PRIORITY) {
+          t.setPriority(Thread.NORM_PRIORITY);
+        }
+        return t;
+      }
+
+    };
+  }
 
   /** Called after a new FileSystem instance is constructed.
    * @param name a uri whose authority section names the host, port, etc.
@@ -89,14 +165,16 @@ public class S3AFileSystem extends FileSystem {
   public void initialize(URI name, Configuration conf) throws IOException {
     super.initialize(name, conf);
 
-
     uri = URI.create(name.getScheme() + "://" + name.getAuthority());
     workingDir = new Path("/user", System.getProperty("user.name")).makeQualified(this.uri,
         this.getWorkingDirectory());
 
     // Try to get our credentials or just connect anonymously
-    String accessKey = conf.get(ACCESS_KEY, null);
-    String secretKey = conf.get(SECRET_KEY, null);
+    // CLOUDERA-BUILD: deprecated keys are alias of supported keys.
+    String accessKey = conf.get(
+        ACCESS_KEY, conf.get(DEPRECATED_ACCESS_KEY, null));
+    String secretKey = conf.get(
+        SECRET_KEY, conf.get(DEPRECATED_SECRET_KEY, null));
 
     String userInfo = name.getUserInfo();
     if (userInfo != null) {
@@ -124,6 +202,8 @@ public class S3AFileSystem extends FileSystem {
       DEFAULT_SECURE_CONNECTIONS) ?  Protocol.HTTPS : Protocol.HTTP);
     awsConf.setMaxErrorRetry(conf.getInt(MAX_ERROR_RETRIES, 
       DEFAULT_MAX_ERROR_RETRIES));
+    awsConf.setConnectionTimeout(conf.getInt(ESTABLISH_TIMEOUT,
+        DEFAULT_ESTABLISH_TIMEOUT));
     awsConf.setSocketTimeout(conf.getInt(SOCKET_TIMEOUT, 
       DEFAULT_SOCKET_TIMEOUT));
 
@@ -131,7 +211,7 @@ public class S3AFileSystem extends FileSystem {
 
     maxKeys = conf.getInt(MAX_PAGING_KEYS, DEFAULT_MAX_PAGING_KEYS);
     partSize = conf.getLong(MULTIPART_SIZE, DEFAULT_MULTIPART_SIZE);
-    partSizeThreshold = conf.getInt(MIN_MULTIPART_THRESHOLD, 
+    multiPartThreshold = conf.getInt(MIN_MULTIPART_THRESHOLD,
       DEFAULT_MIN_MULTIPART_THRESHOLD);
 
     if (partSize < 5 * 1024 * 1024) {
@@ -139,10 +219,38 @@ public class S3AFileSystem extends FileSystem {
       partSize = 5 * 1024 * 1024;
     }
 
-    if (partSizeThreshold < 5 * 1024 * 1024) {
+    if (multiPartThreshold < 5 * 1024 * 1024) {
       LOG.error(MIN_MULTIPART_THRESHOLD + " must be at least 5 MB");
-      partSizeThreshold = 5 * 1024 * 1024;
+      multiPartThreshold = 5 * 1024 * 1024;
     }
+
+    int maxThreads = conf.getInt(MAX_THREADS, DEFAULT_MAX_THREADS);
+    int coreThreads = conf.getInt(CORE_THREADS, DEFAULT_CORE_THREADS);
+    if (maxThreads == 0) {
+      maxThreads = Runtime.getRuntime().availableProcessors() * 8;
+    }
+    if (coreThreads == 0) {
+      coreThreads = Runtime.getRuntime().availableProcessors() * 8;
+    }
+    long keepAliveTime = conf.getLong(KEEPALIVE_TIME, DEFAULT_KEEPALIVE_TIME);
+    LinkedBlockingQueue<Runnable> workQueue =
+      new LinkedBlockingQueue<>(maxThreads *
+        conf.getInt(MAX_TOTAL_TASKS, DEFAULT_MAX_TOTAL_TASKS));
+    threadPoolExecutor = new ThreadPoolExecutor(
+        coreThreads,
+        maxThreads,
+        keepAliveTime,
+        TimeUnit.SECONDS,
+        workQueue,
+        newDaemonThreadFactory("s3a-transfer-shared-"));
+    threadPoolExecutor.allowCoreThreadTimeOut(true);
+
+    TransferManagerConfiguration transferConfiguration = new TransferManagerConfiguration();
+    transferConfiguration.setMinimumUploadPartSize(partSize);
+    transferConfiguration.setMultipartUploadThreshold(multiPartThreshold);
+
+    transfers = new TransferManager(s3, threadPoolExecutor);
+    transfers.setConfiguration(transferConfiguration);
 
     String cannedACLName = conf.get(CANNED_ACL, DEFAULT_CANNED_ACL);
     if (!cannedACLName.isEmpty()) {
@@ -161,11 +269,9 @@ public class S3AFileSystem extends FileSystem {
       DEFAULT_PURGE_EXISTING_MULTIPART_AGE);
 
     if (purgeExistingMultipart) {
-      TransferManager transferManager = new TransferManager(s3);
       Date purgeBefore = new Date(new Date().getTime() - purgeExistingMultipartAge*1000);
 
-      transferManager.abortMultipartUploads(bucket, purgeBefore);
-      transferManager.shutdownNow(false);
+      transfers.abortMultipartUploads(bucket, purgeBefore);
     }
 
     serverSideEncryptionAlgorithm = conf.get(SERVER_SIDE_ENCRYPTION_ALGORITHM);
@@ -218,7 +324,9 @@ public class S3AFileSystem extends FileSystem {
   public FSDataInputStream open(Path f, int bufferSize)
       throws IOException {
 
-    LOG.info("Opening '" + f + "' for reading");
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Opening '{}' for reading.", f);
+    }
     final FileStatus fileStatus = getFileStatus(f);
     if (fileStatus.isDirectory()) {
       throw new FileNotFoundException("Can't open " + f + " because it is a directory");
@@ -249,9 +357,14 @@ public class S3AFileSystem extends FileSystem {
     if (!overwrite && exists(f)) {
       throw new FileAlreadyExistsException(f + " already exists");
     }
-
+    if (getConf().getBoolean(FAST_UPLOAD, DEFAULT_FAST_UPLOAD)) {
+      return new FSDataOutputStream(new S3AFastOutputStream(s3, this, bucket,
+          key, progress, statistics, cannedACL,
+          serverSideEncryptionAlgorithm, partSize, (long)multiPartThreshold,
+          threadPoolExecutor), statistics);
+    }
     // We pass null to FSDataOutputStream so it won't count writes that are being buffered to a file
-    return new FSDataOutputStream(new S3AOutputStream(getConf(), s3, this, 
+    return new FSDataOutputStream(new S3AOutputStream(getConf(), transfers, this,
       bucket, key, progress, cannedACL, statistics, 
       serverSideEncryptionAlgorithm), null);
   }
@@ -289,43 +402,49 @@ public class S3AFileSystem extends FileSystem {
    * @return true if rename is successful
    */
   public boolean rename(Path src, Path dst) throws IOException {
-    LOG.info("Rename path " + src + " to " + dst);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Rename path {} to {}", src, dst);
+    }
 
     String srcKey = pathToKey(src);
     String dstKey = pathToKey(dst);
 
-    if (srcKey.length() == 0 || dstKey.length() == 0) {
-      LOG.info("rename: src or dst are empty");
+    if (srcKey.isEmpty() || dstKey.isEmpty()) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("rename: src or dst are empty");
+      }
       return false;
-    }
-
-    if (srcKey.equals(dstKey)) {
-      LOG.info("rename: src and dst refer to the same file");
-      return true;
     }
 
     S3AFileStatus srcStatus;
     try {
       srcStatus = getFileStatus(src);
     } catch (FileNotFoundException e) {
-      LOG.info("rename: src not found " + src);
+      LOG.error("rename: src not found {}", src);
       return false;
+    }
+
+    if (srcKey.equals(dstKey)) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("rename: src and dst refer to the same file or directory");
+      }
+      return srcStatus.isFile();
     }
 
     S3AFileStatus dstStatus = null;
     try {
       dstStatus = getFileStatus(dst);
 
-      if (srcStatus.isFile() && dstStatus.isDirectory()) {
-        LOG.info("rename: src is a file and dst is a directory");
-        return false;
-      }
-
       if (srcStatus.isDirectory() && dstStatus.isFile()) {
-        LOG.info("rename: src is a directory and dst is a file");
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("rename: src is a directory and dst is a file");
+        }
         return false;
       }
 
+      if (dstStatus.isDirectory() && !dstStatus.isEmptyDirectory()) {
+        return false;
+      }
     } catch (FileNotFoundException e) {
       // Parent must exist
       Path parent = dst.getParent();
@@ -346,7 +465,18 @@ public class S3AFileSystem extends FileSystem {
       if (LOG.isDebugEnabled()) {
         LOG.debug("rename: renaming file " + src + " to " + dst);
       }
-      copyFile(srcKey, dstKey);
+      if (dstStatus != null && dstStatus.isDirectory()) {
+        String newDstKey = dstKey;
+        if (!newDstKey.endsWith("/")) {
+          newDstKey = newDstKey + "/";
+        }
+        String filename =
+            srcKey.substring(pathToKey(src.getParent()).length()+1);
+        newDstKey = newDstKey + filename;
+        copyFile(srcKey, newDstKey);
+      } else {
+        copyFile(srcKey, dstKey);
+      }
       delete(src, false);
     } else {
       if (LOG.isDebugEnabled()) {
@@ -362,12 +492,19 @@ public class S3AFileSystem extends FileSystem {
         srcKey = srcKey + "/";
       }
 
+      //Verify dest is not a child of the source directory
+      if (dstKey.startsWith(srcKey)) {
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("cannot rename a directory to a subdirectory of self");
+        }
+        return false;
+      }
+
       List<DeleteObjectsRequest.KeyVersion> keysToDelete = 
-        new ArrayList<DeleteObjectsRequest.KeyVersion>();
+        new ArrayList<>();
       if (dstStatus != null && dstStatus.isEmptyDirectory()) {
-        copyFile(srcKey, dstKey);
-        statistics.incrementWriteOps(1);
-        keysToDelete.add(new DeleteObjectsRequest.KeyVersion(srcKey));
+        // delete unnecessary fake directory.
+        keysToDelete.add(new DeleteObjectsRequest.KeyVersion(dstKey));
       }
 
       ListObjectsRequest request = new ListObjectsRequest();
@@ -383,22 +520,28 @@ public class S3AFileSystem extends FileSystem {
           keysToDelete.add(new DeleteObjectsRequest.KeyVersion(summary.getKey()));
           String newDstKey = dstKey + summary.getKey().substring(srcKey.length());
           copyFile(summary.getKey(), newDstKey);
+
+          if (keysToDelete.size() == MAX_ENTRIES_TO_DELETE) {
+            DeleteObjectsRequest deleteRequest =
+                new DeleteObjectsRequest(bucket).withKeys(keysToDelete);
+            s3.deleteObjects(deleteRequest);
+            statistics.incrementWriteOps(1);
+            keysToDelete.clear();
+          }
         }
 
         if (objects.isTruncated()) {
           objects = s3.listNextBatchOfObjects(objects);
           statistics.incrementReadOps(1);
         } else {
+          if (keysToDelete.size() > 0) {
+            DeleteObjectsRequest deleteRequest =
+                new DeleteObjectsRequest(bucket).withKeys(keysToDelete);
+            s3.deleteObjects(deleteRequest);
+            statistics.incrementWriteOps(1);
+          }
           break;
         }
-      }
-
-
-      if (!keysToDelete.isEmpty()) {
-        DeleteObjectsRequest deleteRequest = new DeleteObjectsRequest(bucket);
-        deleteRequest.setKeys(keysToDelete);
-        s3.deleteObjects(deleteRequest);
-        statistics.incrementWriteOps(1);
       }
     }
 
@@ -419,7 +562,9 @@ public class S3AFileSystem extends FileSystem {
    * @throws IOException
    */
   public boolean delete(Path f, boolean recursive) throws IOException {
-    LOG.info("Delete path " + f + " - recursive " + recursive);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Delete path " + f + " - recursive " + recursive);
+    }
     S3AFileStatus status;
     try {
       status = getFileStatus(f);
@@ -470,7 +615,7 @@ public class S3AFileSystem extends FileSystem {
         request.setMaxKeys(maxKeys);
 
         List<DeleteObjectsRequest.KeyVersion> keys = 
-          new ArrayList<DeleteObjectsRequest.KeyVersion>();
+          new ArrayList<>();
         ObjectListing objects = s3.listObjects(request);
         statistics.incrementReadOps(1);
         while (true) {
@@ -479,18 +624,26 @@ public class S3AFileSystem extends FileSystem {
             if (LOG.isDebugEnabled()) {
               LOG.debug("Got object to delete " + summary.getKey());
             }
-          }
 
-          DeleteObjectsRequest deleteRequest = new DeleteObjectsRequest(bucket);
-          deleteRequest.setKeys(keys);
-          s3.deleteObjects(deleteRequest);
-          statistics.incrementWriteOps(1);
-          keys.clear();
+            if (keys.size() == MAX_ENTRIES_TO_DELETE) {
+              DeleteObjectsRequest deleteRequest =
+                  new DeleteObjectsRequest(bucket).withKeys(keys);
+              s3.deleteObjects(deleteRequest);
+              statistics.incrementWriteOps(1);
+              keys.clear();
+            }
+          }
 
           if (objects.isTruncated()) {
             objects = s3.listNextBatchOfObjects(objects);
             statistics.incrementReadOps(1);
           } else {
+            if (!keys.isEmpty()) {
+              DeleteObjectsRequest deleteRequest =
+                  new DeleteObjectsRequest(bucket).withKeys(keys);
+              s3.deleteObjects(deleteRequest);
+              statistics.incrementWriteOps(1);
+            }
             break;
           }
         }
@@ -530,7 +683,9 @@ public class S3AFileSystem extends FileSystem {
   public FileStatus[] listStatus(Path f) throws FileNotFoundException,
       IOException {
     String key = pathToKey(f);
-    LOG.info("List status for path: " + f);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("List status for path: " + f);
+    }
 
     final List<FileStatus> result = new ArrayList<FileStatus>();
     final FileStatus fileStatus =  getFileStatus(f);
@@ -571,7 +726,8 @@ public class S3AFileSystem extends FileSystem {
             }
           } else {
             result.add(new S3AFileStatus(summary.getSize(), 
-              dateToLong(summary.getLastModified()), keyPath));
+                dateToLong(summary.getLastModified()), keyPath,
+                getDefaultBlockSize(f.makeQualified(uri, workingDir))));
             if (LOG.isDebugEnabled()) {
               LOG.debug("Adding: fi: " + keyPath);
             }
@@ -640,7 +796,10 @@ public class S3AFileSystem extends FileSystem {
   // TODO: If we have created an empty file at /foo/bar and we then call 
   // mkdirs for /foo/bar/baz/roo what happens to the empty file /foo/bar/?
   public boolean mkdirs(Path f, FsPermission permission) throws IOException {
-    LOG.info("Making directory: " + f);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Making directory: " + f);
+    }
+
 
     try {
       FileStatus fileStatus = getFileStatus(f);
@@ -680,8 +839,10 @@ public class S3AFileSystem extends FileSystem {
    */
   public S3AFileStatus getFileStatus(Path f) throws IOException {
     String key = pathToKey(f);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Getting path status for " + f + " (" + key + ")");
+    }
 
-    LOG.info("Getting path status for " + f + " (" + key + ")");
 
     if (!key.isEmpty()) {
       try {
@@ -692,13 +853,16 @@ public class S3AFileSystem extends FileSystem {
           if (LOG.isDebugEnabled()) {
             LOG.debug("Found exact file: fake directory");
           }
-          return new S3AFileStatus(true, true, f.makeQualified(uri, workingDir));
+          return new S3AFileStatus(true, true,
+              f.makeQualified(uri, workingDir));
         } else {
           if (LOG.isDebugEnabled()) {
             LOG.debug("Found exact file: normal file");
           }
-          return new S3AFileStatus(meta.getContentLength(), dateToLong(meta.getLastModified()),
-              f.makeQualified(uri, workingDir));
+          return new S3AFileStatus(meta.getContentLength(),
+              dateToLong(meta.getLastModified()),
+              f.makeQualified(uri, workingDir),
+              getDefaultBlockSize(f.makeQualified(uri, workingDir)));
         }
       } catch (AmazonServiceException e) {
         if (e.getStatusCode() != 404) {
@@ -723,10 +887,12 @@ public class S3AFileSystem extends FileSystem {
             }
             return new S3AFileStatus(true, true, f.makeQualified(uri, workingDir));
           } else {
-            LOG.warn("Found file (with /): real file? should not happen: " + key);
+            LOG.warn("Found file (with /): real file? should not happen: {}", key);
 
-            return new S3AFileStatus(meta.getContentLength(), dateToLong(meta.getLastModified()),
-                f.makeQualified(uri, workingDir));
+            return new S3AFileStatus(meta.getContentLength(),
+                dateToLong(meta.getLastModified()),
+                f.makeQualified(uri, workingDir),
+                getDefaultBlockSize(f.makeQualified(uri, workingDir)));
           }
         } catch (AmazonServiceException e) {
           if (e.getStatusCode() != 404) {
@@ -753,7 +919,8 @@ public class S3AFileSystem extends FileSystem {
       ObjectListing objects = s3.listObjects(request);
       statistics.incrementReadOps(1);
 
-      if (objects.getCommonPrefixes().size() > 0 || objects.getObjectSummaries().size() > 0) {
+      if (!objects.getCommonPrefixes().isEmpty()
+          || objects.getObjectSummaries().size() > 0) {
         if (LOG.isDebugEnabled()) {
           LOG.debug("Found path as directory (with /): " + 
             objects.getCommonPrefixes().size() + "/" + 
@@ -767,7 +934,8 @@ public class S3AFileSystem extends FileSystem {
           }
         }
 
-        return new S3AFileStatus(true, false, f.makeQualified(uri, workingDir));
+        return new S3AFileStatus(true, false,
+            f.makeQualified(uri, workingDir));
       }
     } catch (AmazonServiceException e) {
       if (e.getStatusCode() != 404) {
@@ -806,19 +974,13 @@ public class S3AFileSystem extends FileSystem {
     if (!overwrite && exists(dst)) {
       throw new IOException(dst + " already exists");
     }
-
-    LOG.info("Copying local file from " + src + " to " + dst);
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Copying local file from " + src + " to " + dst);
+    }
 
     // Since we have a local file, we don't need to stream into a temporary file
     LocalFileSystem local = getLocal(getConf());
     File srcfile = local.pathToFile(src);
-
-    TransferManagerConfiguration transferConfiguration = new TransferManagerConfiguration();
-    transferConfiguration.setMinimumUploadPartSize(partSize);
-    transferConfiguration.setMultipartUploadThreshold(partSizeThreshold);
-
-    TransferManager transfers = new TransferManager(s3);
-    transfers.setConfiguration(transferConfiguration);
 
     final ObjectMetadata om = new ObjectMetadata();
     if (StringUtils.isNotBlank(serverSideEncryptionAlgorithm)) {
@@ -845,8 +1007,6 @@ public class S3AFileSystem extends FileSystem {
       statistics.incrementWriteOps(1);
     } catch (InterruptedException e) {
       throw new IOException("Got interrupted, cancelling");
-    } finally {
-      transfers.shutdownNow(false);
     }
 
     // This will delete unnecessary fake parent directories
@@ -854,6 +1014,18 @@ public class S3AFileSystem extends FileSystem {
 
     if (delSrc) {
       local.delete(src, false);
+    }
+  }
+
+  @Override
+  public void close() throws IOException {
+    try {
+      super.close();
+    } finally {
+      if (transfers != null) {
+        transfers.shutdownNow(true);
+        transfers = null;
+      }
     }
   }
 
@@ -870,12 +1042,6 @@ public class S3AFileSystem extends FileSystem {
     if (LOG.isDebugEnabled()) {
       LOG.debug("copyFile " + srcKey + " -> " + dstKey);
     }
-
-    TransferManagerConfiguration transferConfiguration = new TransferManagerConfiguration();
-    transferConfiguration.setMultipartCopyPartSize(partSize);
-
-    TransferManager transfers = new TransferManager(s3);
-    transfers.setConfiguration(transferConfiguration);
 
     ObjectMetadata srcom = s3.getObjectMetadata(bucket, srcKey);
     final ObjectMetadata dstom = srcom.clone();
@@ -903,8 +1069,6 @@ public class S3AFileSystem extends FileSystem {
       statistics.incrementWriteOps(1);
     } catch (InterruptedException e) {
       throw new IOException("Got interrupted, cancelling");
-    } finally {
-      transfers.shutdownNow(false);
     }
   }
 
@@ -942,8 +1106,8 @@ public class S3AFileSystem extends FileSystem {
           s3.deleteObject(bucket, key + "/");
           statistics.incrementWriteOps(1);
         }
-      } catch (FileNotFoundException e) {
-      } catch (AmazonServiceException e) {}
+      } catch (FileNotFoundException | AmazonServiceException e) {
+      }
 
       if (f.isRoot()) {
         break;
@@ -992,7 +1156,7 @@ public class S3AFileSystem extends FileSystem {
   @Deprecated
   public long getDefaultBlockSize() {
     // default to 32MB: large enough to minimize the impact of seeks
-    return getConf().getLong("fs.s3a.block.size", 32 * 1024 * 1024);
+    return getConf().getLong(FS_S3A_BLOCK_SIZE, DEFAULT_BLOCKSIZE);
   }
 
   private void printAmazonServiceException(AmazonServiceException ase) {
@@ -1010,6 +1174,6 @@ public class S3AFileSystem extends FileSystem {
     LOG.info("Caught an AmazonClientException, which means the client encountered " +
         "a serious internal problem while trying to communicate with S3, " +
         "such as not being able to access the network.");
-    LOG.info("Error Message: " + ace.getMessage());
+    LOG.info("Error Message: {}" + ace, ace);
   }
 }

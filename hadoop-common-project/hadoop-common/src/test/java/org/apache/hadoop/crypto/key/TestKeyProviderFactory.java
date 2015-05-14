@@ -33,6 +33,7 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.ProviderUtils;
 import org.apache.hadoop.security.UserGroupInformation;
+import org.apache.hadoop.test.GenericTestUtils;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
@@ -41,6 +42,7 @@ import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.fail;
 
 public class TestKeyProviderFactory {
 
@@ -328,6 +330,16 @@ public class TestKeyProviderFactory {
     // check permission retention after explicit change
     fs.setPermission(path, new FsPermission("777"));
     checkPermissionRetention(conf, ourUrl, path);
+
+    // Check that an uppercase keyname results in an error
+    provider = KeyProviderFactory.getProviders(conf).get(0);
+    try {
+      provider.createKey("UPPERCASE", KeyProvider.options(conf));
+      Assert.fail("Expected failure on creating key name with uppercase " +
+          "characters");
+    } catch (IllegalArgumentException e) {
+      GenericTestUtils.assertExceptionContains("Uppercase key names", e);
+    }
   }
 
   private void verifyAfterReload(File file, KeyProvider provider)
@@ -418,5 +430,52 @@ public class TestKeyProviderFactory {
     kp = KeyProviderFactory.get(uri, conf);
     Assert.assertNull(kp);
 
+  }
+
+  @Test
+  public void testJksProviderWithKeytoolKeys() throws Exception {
+    final Configuration conf = new Configuration();
+    final String keystoreDirAbsolutePath =
+        conf.getResource("hdfs7067.keystore").getPath();
+    final String ourUrl = JavaKeyStoreProvider.SCHEME_NAME + "://file@/" +
+        keystoreDirAbsolutePath;
+
+    conf.set(KeyProviderFactory.KEY_PROVIDER_PATH, ourUrl);
+
+    final KeyProvider provider = KeyProviderFactory.getProviders(conf).get(0);
+
+    // Sanity check that we are using the right keystore
+    @SuppressWarnings("unused")
+    final KeyProvider.KeyVersion keyVersion =
+            provider.getKeyVersion("testkey5@0");
+    try {
+      @SuppressWarnings("unused")
+      final KeyProvider.KeyVersion keyVersionWrongKeyNameFormat =
+          provider.getKeyVersion("testkey2");
+      fail("should have thrown an exception");
+    } catch (IOException e) {
+      // No version in key path testkey2/
+      GenericTestUtils.assertExceptionContains("No version in key path", e);
+    }
+    try {
+      @SuppressWarnings("unused")
+      final KeyProvider.KeyVersion keyVersionCurrentKeyNotWrongKeyNameFormat =
+          provider.getCurrentKey("testkey5@0");
+      fail("should have thrown an exception getting testkey5@0");
+    } catch (IOException e) {
+      // javax.crypto.spec.SecretKeySpec cannot be cast to
+      // org.apache.hadoop.crypto.key.JavaKeyStoreProvider$KeyMetadata
+      GenericTestUtils.assertExceptionContains("other non-Hadoop method", e);
+    }
+    try {
+      @SuppressWarnings("unused")
+      KeyProvider.KeyVersion keyVersionCurrentKeyNotReally =
+          provider.getCurrentKey("testkey2");
+      fail("should have thrown an exception getting testkey2");
+    } catch (IOException e) {
+      // javax.crypto.spec.SecretKeySpec cannot be cast to
+      // org.apache.hadoop.crypto.key.JavaKeyStoreProvider$KeyMetadata
+      GenericTestUtils.assertExceptionContains("other non-Hadoop method", e);
+    }
   }
 }

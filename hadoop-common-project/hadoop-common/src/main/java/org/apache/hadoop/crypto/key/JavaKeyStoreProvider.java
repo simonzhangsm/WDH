@@ -18,9 +18,9 @@
 
 package org.apache.hadoop.crypto.key;
 
+import com.google.common.base.Preconditions;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.classification.InterfaceAudience;
-import org.apache.hadoop.classification.InterfaceAudience.Private;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
@@ -405,6 +405,10 @@ public class JavaKeyStoreProvider extends KeyProvider {
         Metadata meta = ((KeyMetadata) keyStore.getKey(name, password)).metadata;
         cache.put(name, meta);
         return meta;
+      } catch (ClassCastException e) {
+        throw new IOException("Can't cast key for " + name + " in keystore " +
+            path + " to a KeyMetadata. Key may have been added using " +
+            " keytool or some other non-Hadoop method.", e);
       } catch (KeyStoreException e) {
         throw new IOException("Can't get metadata for " + name +
             " from keystore " + path, e);
@@ -423,6 +427,8 @@ public class JavaKeyStoreProvider extends KeyProvider {
   @Override
   public KeyVersion createKey(String name, byte[] material,
                                Options options) throws IOException {
+    Preconditions.checkArgument(name.equals(name.toLowerCase()),
+        "Uppercase key names are unsupported: %s", name);
     writeLock.lock();
     try {
       try {

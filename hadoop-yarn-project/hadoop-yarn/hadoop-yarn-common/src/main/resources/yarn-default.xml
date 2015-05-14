@@ -224,7 +224,7 @@
   <property>
     <description>The class to use as the resource scheduler.</description>
     <name>yarn.resourcemanager.scheduler.class</name>
-    <value>org.apache.hadoop.yarn.server.resourcemanager.scheduler.capacity.CapacityScheduler</value>
+    <value>org.apache.hadoop.yarn.server.resourcemanager.scheduler.fair.FairScheduler</value>
   </property>
 
   <property>
@@ -867,7 +867,7 @@
     <description>Whether virtual memory limits will be enforced for
     containers.</description>
     <name>yarn.nodemanager.vmem-check-enabled</name>
-    <value>true</value>
+    <value>false</value>
   </property>
 
   <property>

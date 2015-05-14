@@ -120,6 +120,12 @@ HDFS Commands Guide
 
    Usage: <<<hdfs version>>>
 
+** <<<version>>>
+
+   Prints the version.
+
+   Usage: <<<hdfs version>>>
+
 * Administration Commands
 
    Commands useful for administrators of a hadoop cluster.
@@ -170,7 +176,7 @@ HDFS Commands Guide
    Runs a HDFS dfsadmin client.
 
 +------------------------------------------+
-   Usage: hdfs dfsadmin [GENERIC_OPTIONS]
+   Usage: <<<hdfs dfsadmin [GENERIC_OPTIONS]
           [-report [-live] [-dead] [-decommissioning]]
           [-safemode enter | leave | get | wait]
           [-saveNamespace]
@@ -191,6 +197,7 @@ HDFS Commands Guide
           [-refreshSuperUserGroupsConfiguration]
           [-refreshCallQueue]
           [-refresh <host:ipc_port> <key> [arg1..argn]]
+          [-reconfig <datanode|...> <host:ipc_port> <start|status>]
           [-printTopology]
           [-refreshNamenodes datanodehost:port]
           [-deleteBlockPool datanode-host:port blockpoolId [force]]
@@ -200,7 +207,8 @@ HDFS Commands Guide
           [-fetchImage <local directory>]
           [-shutdownDatanode <datanode_host:ipc_port> [upgrade]]
           [-getDatanodeInfo <datanode_host:ipc_port>]
-          [-help [cmd]]
+          [-triggerBlockReport [-incremental] <datanode_host:ipc_port>]
+          [-help [cmd]]>>>
 +------------------------------------------+
 
 *-----------------+-----------------------------------------------------------+
@@ -263,10 +271,10 @@ HDFS Commands Guide
                   | {{{../hadoop-hdfs/HdfsRollingUpgrade.html#dfsadmin_-rollingUpgrade}Rolling Upgrade document}}
                   | for the detail.
 *-----------------+-----------------------------------------------------------+
-| -metasave filename | Save Namenode's primary data structures to <filename> in
+| -metasave filename | Save Namenode's primary data structures to \<filename\> in
                   | the directory specified by hadoop.log.dir property.
-                  | <filename> is overwritten if it exists.
-                  | <filename> will contain one line for each of the following\
+                  | \<filename\> is overwritten if it exists.
+                  | \<filename\> will contain one line for each of the following\
                   | 1. Datanodes heart beating with Namenode\
                   | 2. Blocks waiting to be replicated\
                   | 3. Blocks currently being replicated\
@@ -283,6 +291,12 @@ HDFS Commands Guide
 | -refresh \<host:ipc_port\> \<key\> [arg1..argn] | Triggers a runtime-refresh
                   | of the resource specified by \<key\> on \<host:ipc_port\>.
                   | All other args after are sent to the host.
+*-----------------+-----------------------------------------------------------+
+| -reconfig \<datanode|...\> \<host:ipc_port\> \<start|status\> | Start
+                  | reconfiguration or get the status of an ongoing
+                  | reconfiguration. The second parameter specifies the node
+                  | type. Currently, only reloading DataNode's configuration is
+                  | supported.
 *-----------------+-----------------------------------------------------------+
 | -printTopology  | Print a tree of the racks and their nodes as reported by
                   | the Namenode
@@ -326,6 +340,11 @@ HDFS Commands Guide
                   | given datanode. See
                   | {{{./HdfsRollingUpgrade.html#dfsadmin_-getDatanodeInfo}Rolling Upgrade document}}
                   | for the detail.
+*-----------------+-----------------------------------------------------------+
+| -triggerBlockReport [-incremental] \<datanode_host:ipc_port\> | Trigger a
+                  | block report for the given datanode.  If 'incremental' is
+                  | specified, it will be | an incremental block report;
+                  | otherwise, it will be a full block report.
 *-----------------+-----------------------------------------------------------+
 | -help [cmd]     | Displays help for the given command or all commands if none
                   | is specified.

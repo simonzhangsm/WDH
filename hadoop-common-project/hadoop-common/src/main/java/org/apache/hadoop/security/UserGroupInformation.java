@@ -86,9 +86,21 @@ public class UserGroupInformation {
    * Percentage of the ticket window to use before we renew ticket.
    */
   private static final float TICKET_RENEW_WINDOW = 0.80f;
+  private static boolean shouldRenewImmediatelyForTests = false;
   static final String HADOOP_USER_NAME = "HADOOP_USER_NAME";
   static final String HADOOP_PROXY_USER = "HADOOP_PROXY_USER";
-  
+
+  /**
+   * For the purposes of unit tests, we want to test login
+   * from keytab and don't want to wait until the renew
+   * window (controlled by TICKET_RENEW_WINDOW).
+   * @param immediate true if we should login without waiting for ticket window
+   */
+  @VisibleForTesting
+  static void setShouldRenewImmediatelyForTests(boolean immediate) {
+    shouldRenewImmediatelyForTests = immediate;
+  }
+
   /** 
    * UgiMetrics maintains UGI activity statistics
    * and publishes them through the metrics interfaces.
@@ -586,6 +598,20 @@ public class UserGroupInformation {
     user.setLogin(login);
   }
 
+  private static Class<?> KEY_TAB_CLASS = KerberosKey.class;
+  static {
+    try {
+      // We use KEY_TAB_CLASS to determine if the UGI is logged in from
+      // keytab. In JDK6 and JDK7, if useKeyTab and storeKey are specified
+      // in the Krb5LoginModule, then some number of KerberosKey objects
+      // are added to the Subject's private credentials. However, in JDK8,
+      // a KeyTab object is added instead. More details in HADOOP-10786.
+      KEY_TAB_CLASS = Class.forName("javax.security.auth.kerberos.KeyTab");
+    } catch (ClassNotFoundException cnfe) {
+      // Ignore. javax.security.auth.kerberos.KeyTab does not exist in JDK6.
+    }
+  }
+
   /**
    * Create a UserGroupInformation for the given subject.
    * This does not change the subject or acquire new credentials.
@@ -594,7 +620,7 @@ public class UserGroupInformation {
   UserGroupInformation(Subject subject) {
     this.subject = subject;
     this.user = subject.getPrincipals(User.class).iterator().next();
-    this.isKeytab = !subject.getPrivateCredentials(KerberosKey.class).isEmpty();
+    this.isKeytab = !subject.getPrivateCredentials(KEY_TAB_CLASS).isEmpty();
     this.isKrbTkt = !subject.getPrivateCredentials(KerberosTicket.class).isEmpty();
   }
   
@@ -749,7 +775,22 @@ public class UserGroupInformation {
     }
     return loginUser;
   }
-  
+
+  /**
+   * remove the login method that is followed by a space from the username
+   * e.g. "jack (auth:SIMPLE)" -> "jack"
+   *
+   * @param userName
+   * @return userName without login method
+   */
+  public static String trimLoginMethod(String userName) {
+    int spaceIndex = userName.indexOf(' ');
+    if (spaceIndex >= 0) {
+      userName = userName.substring(0, spaceIndex);
+    }
+    return userName;
+  }
+
   /**
    * Log in a user using the given subject
    * @parma subject the subject to use when logging in a user, or null to 
@@ -950,7 +991,8 @@ public class UserGroupInformation {
         || !isKeytab)
       return;
     KerberosTicket tgt = getTGT();
-    if (tgt != null && Time.now() < getRefreshTime(tgt)) {
+    if (tgt != null && !shouldRenewImmediatelyForTests &&
+        Time.now() < getRefreshTime(tgt)) {
       return;
     }
     reloginFromKeytab();
@@ -975,13 +1017,14 @@ public class UserGroupInformation {
       return;
     
     long now = Time.now();
-    if (!hasSufficientTimeElapsed(now)) {
+    if (!shouldRenewImmediatelyForTests && !hasSufficientTimeElapsed(now)) {
       return;
     }
 
     KerberosTicket tgt = getTGT();
     //Return if TGT is valid and is not going to expire soon.
-    if (tgt != null && now < getRefreshTime(tgt)) {
+    if (tgt != null && !shouldRenewImmediatelyForTests &&
+        now < getRefreshTime(tgt)) {
       return;
     }
     
@@ -1628,9 +1671,7 @@ public class UserGroupInformation {
       return Subject.doAs(subject, action);
     } catch (PrivilegedActionException pae) {
       Throwable cause = pae.getCause();
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("PrivilegedActionException as:" + this + " cause:" + cause);
-      }
+      LOG.warn("PriviledgedActionException as:"+this+" cause:"+cause);
       if (cause instanceof IOException) {
         throw (IOException) cause;
       } else if (cause instanceof Error) {

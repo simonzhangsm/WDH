@@ -132,12 +132,17 @@ public class DatanodeManager {
    * writing to stale datanodes, i.e., continue using stale nodes for writing.
    */
   private final float ratioUseStaleDataNodesForWrite;
-  
+
   /** The number of stale DataNodes */
   private volatile int numStaleNodes;
 
   /** The number of stale storages */
   private volatile int numStaleStorages;
+
+  /**
+   * Number of blocks to check for each postponedMisreplicatedBlocks iteration
+   */
+  private final long blocksPerPostponedMisreplicatedBlocksRescan;
 
   /**
    * Whether or not this cluster has ever consisted of more than 1 rack,
@@ -257,6 +262,9 @@ public class DatanodeManager {
     this.timeBetweenResendingCachingDirectivesMs = conf.getLong(
         DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_RETRY_INTERVAL_MS,
         DFSConfigKeys.DFS_NAMENODE_PATH_BASED_CACHE_RETRY_INTERVAL_MS_DEFAULT);
+    this.blocksPerPostponedMisreplicatedBlocksRescan = conf.getLong(
+        DFSConfigKeys.DFS_NAMENODE_BLOCKS_PER_POSTPONEDBLOCKS_RESCAN_KEY,
+        DFSConfigKeys.DFS_NAMENODE_BLOCKS_PER_POSTPONEDBLOCKS_RESCAN_KEY_DEFAULT);
   }
 
   private static long getStaleIntervalFromConf(Configuration conf,
@@ -376,6 +384,8 @@ public class DatanodeManager {
       }
       int activeLen = lastActiveIndex + 1;      
       networktopology.sortByDistance(client, b.getLocations(), activeLen);
+      // must update cache since we modified locations array
+      b.updateCachedStorageInfo();
     }
   }
   
@@ -476,7 +486,7 @@ public class DatanodeManager {
     if (!node.getXferAddr().equals(nodeID.getXferAddr())) {
       final UnregisteredNodeException e = new UnregisteredNodeException(
           nodeID, node);
-      NameNode.stateChangeLog.fatal("BLOCK* NameSystem.getDatanode: "
+      NameNode.stateChangeLog.error("BLOCK* NameSystem.getDatanode: "
                                     + e.getLocalizedMessage());
       throw e;
     }
@@ -593,6 +603,8 @@ public class DatanodeManager {
     synchronized (datanodeMap) {
       host2DatanodeMap.remove(datanodeMap.remove(key));
     }
+    // Also remove all block invalidation tasks under this node
+    blockManager.removeFromInvalidates(new DatanodeInfo(node));
     if (LOG.isDebugEnabled()) {
       LOG.debug(getClass().getSimpleName() + ".wipeDatanode("
           + node + "): storage " + key 
@@ -835,16 +847,21 @@ public class DatanodeManager {
   @InterfaceAudience.Private
   @VisibleForTesting
   public void startDecommission(DatanodeDescriptor node) {
-    if (!node.isDecommissionInProgress() && !node.isDecommissioned()) {
-      for (DatanodeStorageInfo storage : node.getStorageInfos()) {
-        LOG.info("Start Decommissioning " + node + " " + storage
-            + " with " + storage.numBlocks() + " blocks");
+    if (!node.isDecommissionInProgress()) {
+      if (!node.isAlive) {
+        LOG.info("Dead node " + node + " is decommissioned immediately.");
+        node.setDecommissioned();
+      } else if (!node.isDecommissioned()) {
+        for (DatanodeStorageInfo storage : node.getStorageInfos()) {
+          LOG.info("Start Decommissioning " + node + " " + storage
+              + " with " + storage.numBlocks() + " blocks");
+        }
+        heartbeatManager.startDecommission(node);
+        node.decommissioningStatus.setStartTime(now());
+
+        // all the blocks that reside on this node have to be replicated.
+        checkDecommissionState(node);
       }
-      heartbeatManager.startDecommission(node);
-      node.decommissioningStatus.setStartTime(now());
-      
-      // all the blocks that reside on this node have to be replicated.
-      checkDecommissionState(node);
     }
   }
 
@@ -999,14 +1016,13 @@ public class DatanodeManager {
   
         // register new datanode
         addDatanode(nodeDescr);
-        checkDecommissioning(nodeDescr);
-        
         // also treat the registration message as a heartbeat
         // no need to update its timestamp
         // because its is done when the descriptor is created
         heartbeatManager.addDatanode(nodeDescr);
-        success = true;
         incrementVersionCount(nodeReg.getSoftwareVersion());
+        checkDecommissioning(nodeDescr);
+        success = true;
       } finally {
         if (!success) {
           removeDatanode(nodeDescr);
@@ -1098,16 +1114,8 @@ public class DatanodeManager {
   public List<DatanodeDescriptor> getDecommissioningNodes() {
     // There is no need to take namesystem reader lock as
     // getDatanodeListForReport will synchronize on datanodeMap
-    final List<DatanodeDescriptor> decommissioningNodes
-        = new ArrayList<DatanodeDescriptor>();
-    final List<DatanodeDescriptor> results = getDatanodeListForReport(
-        DatanodeReportType.LIVE);
-    for(DatanodeDescriptor node : results) {
-      if (node.isDecommissionInProgress()) {
-        decommissioningNodes.add(node);
-      }
-    }
-    return decommissioningNodes;
+    // A decommissioning DN may be "alive" or "dead".
+    return getDatanodeListForReport(DatanodeReportType.DECOMMISSIONING);
   }
   
   /* Getter and Setter for stale DataNodes related attributes */
@@ -1125,6 +1133,10 @@ public class DatanodeManager {
     return avoidStaleDataNodesForWrite &&
         (numStaleNodes <= heartbeatManager.getLiveDatanodeCount()
             * ratioUseStaleDataNodesForWrite);
+  }
+
+  public long getBlocksPerPostponedMisreplicatedBlocksRescan() {
+    return blocksPerPostponedMisreplicatedBlocksRescan;
   }
 
   /**

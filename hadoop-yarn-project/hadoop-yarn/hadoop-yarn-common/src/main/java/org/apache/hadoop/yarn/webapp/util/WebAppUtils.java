@@ -130,11 +130,23 @@ public class WebAppUtils {
     return addr;
   }
 
+  public static String getResolvedRemoteRMWebAppURLWithScheme(
+      Configuration conf) {
+    return getHttpSchemePrefix(conf)
+        + getResolvedRemoteRMWebAppURLWithoutScheme(conf);
+  }
+
   public static String getResolvedRMWebAppURLWithScheme(Configuration conf) {
     return getHttpSchemePrefix(conf)
         + getResolvedRMWebAppURLWithoutScheme(conf);
   }
   
+  public static String getResolvedRemoteRMWebAppURLWithoutScheme(
+      Configuration conf) {
+    return getResolvedRemoteRMWebAppURLWithoutScheme(conf,
+        YarnConfiguration.useHttps(conf) ? Policy.HTTPS_ONLY : Policy.HTTP_ONLY);
+  }
+
   public static String getResolvedRMWebAppURLWithoutScheme(Configuration conf) {
     return getResolvedRMWebAppURLWithoutScheme(conf,
         YarnConfiguration.useHttps(conf) ? Policy.HTTPS_ONLY : Policy.HTTP_ONLY);
@@ -153,6 +165,38 @@ public class WebAppUtils {
           conf.getSocketAddr(YarnConfiguration.RM_WEBAPP_ADDRESS,
               YarnConfiguration.DEFAULT_RM_WEBAPP_ADDRESS,
               YarnConfiguration.DEFAULT_RM_WEBAPP_PORT);      
+    }
+    return getResolvedAddress(address);
+  }
+
+  public static String getResolvedRemoteRMWebAppURLWithoutScheme(Configuration conf,
+      Policy httpPolicy) {
+    InetSocketAddress address = null;
+    String rmId = null;
+    if (HAUtil.isHAEnabled(conf)) {
+      // If HA enabled, pick one of the RM-IDs and rely on redirect to go to
+      // the Active RM
+      rmId = (String) HAUtil.getRMHAIds(conf).toArray()[0];
+    }
+
+    if (httpPolicy == Policy.HTTPS_ONLY) {
+      address =
+          conf.getSocketAddr(
+              rmId == null
+                  ? YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS
+                  : HAUtil.addSuffix(
+                  YarnConfiguration.RM_WEBAPP_HTTPS_ADDRESS, rmId),
+              YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_ADDRESS,
+              YarnConfiguration.DEFAULT_RM_WEBAPP_HTTPS_PORT);
+    } else {
+      address =
+          conf.getSocketAddr(
+              rmId == null
+                  ? YarnConfiguration.RM_WEBAPP_ADDRESS
+                  : HAUtil.addSuffix(
+                  YarnConfiguration.RM_WEBAPP_ADDRESS, rmId),
+              YarnConfiguration.DEFAULT_RM_WEBAPP_ADDRESS,
+              YarnConfiguration.DEFAULT_RM_WEBAPP_PORT);
     }
     return getResolvedAddress(address);
   }

@@ -56,6 +56,7 @@ import org.apache.hadoop.yarn.server.api.protocolrecords.RegisterNodeManagerResp
 import org.apache.hadoop.yarn.server.api.records.NodeAction;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMApp;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.attempt.RMAppAttemptImpl;
+import org.apache.hadoop.yarn.server.resourcemanager.rmnode.RMNode;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.SchedulerEvent;
 import org.apache.hadoop.yarn.server.utils.BuilderUtils;
@@ -130,16 +131,16 @@ public class TestResourceTrackerService {
 
     rm.getNodesListManager().refreshNodes(conf);
 
+    checkDecommissionedNMCount(rm, ++metricCount);
+
     nodeHeartbeat = nm1.nodeHeartbeat(true);
     Assert.assertTrue(NodeAction.NORMAL.equals(nodeHeartbeat.getNodeAction()));
     Assert
-        .assertEquals(0, ClusterMetrics.getMetrics().getNumDecommisionedNMs());
+        .assertEquals(1, ClusterMetrics.getMetrics().getNumDecommisionedNMs());
 
     nodeHeartbeat = nm2.nodeHeartbeat(true);
     Assert.assertTrue("Node is not decommisioned.", NodeAction.SHUTDOWN
         .equals(nodeHeartbeat.getNodeAction()));
-
-    checkDecommissionedNMCount(rm, ++metricCount);
 
     nodeHeartbeat = nm3.nodeHeartbeat(true);
     Assert.assertTrue(NodeAction.NORMAL.equals(nodeHeartbeat.getNodeAction()));
@@ -185,6 +186,8 @@ public class TestResourceTrackerService {
 
     rm.getNodesListManager().refreshNodes(conf);
 
+    checkDecommissionedNMCount(rm, metricCount + 2);
+
     nodeHeartbeat = nm1.nodeHeartbeat(true);
     Assert.assertTrue(NodeAction.NORMAL.equals(nodeHeartbeat.getNodeAction()));
     nodeHeartbeat = nm2.nodeHeartbeat(true);
@@ -195,7 +198,7 @@ public class TestResourceTrackerService {
     Assert.assertTrue("The decommisioned metrics are not updated",
         NodeAction.SHUTDOWN.equals(nodeHeartbeat.getNodeAction()));
     dispatcher.await();
-    checkDecommissionedNMCount(rm, metricCount + 2);
+
     writeToHostsFile("");
     rm.getNodesListManager().refreshNodes(conf);
 
@@ -234,6 +237,7 @@ public class TestResourceTrackerService {
     conf.set(YarnConfiguration.RM_NODES_INCLUDE_FILE_PATH, hostFile
         .getAbsolutePath());
     rm.getNodesListManager().refreshNodes(conf);
+    checkDecommissionedNMCount(rm, ++initialMetricCount);
     nodeHeartbeat = nm1.nodeHeartbeat(true);
     Assert.assertEquals(
         "Node should not have been decomissioned.",
@@ -243,7 +247,6 @@ public class TestResourceTrackerService {
     Assert.assertEquals("Node should have been decomissioned but is in state" +
         nodeHeartbeat.getNodeAction(),
         NodeAction.SHUTDOWN, nodeHeartbeat.getNodeAction());
-    checkDecommissionedNMCount(rm, ++initialMetricCount);
   }
   
   /**
@@ -271,6 +274,7 @@ public class TestResourceTrackerService {
     conf.set(YarnConfiguration.RM_NODES_EXCLUDE_FILE_PATH, hostFile
         .getAbsolutePath());
     rm.getNodesListManager().refreshNodes(conf);
+    checkDecommissionedNMCount(rm, ++initialMetricCount);
     nodeHeartbeat = nm1.nodeHeartbeat(true);
     Assert.assertEquals(
         "Node should not have been decomissioned.",
@@ -280,7 +284,6 @@ public class TestResourceTrackerService {
     Assert.assertEquals("Node should have been decomissioned but is in state" +
         nodeHeartbeat.getNodeAction(),
         NodeAction.SHUTDOWN, nodeHeartbeat.getNodeAction());
-    checkDecommissionedNMCount(rm, ++initialMetricCount);
   }
 
   @Test
@@ -621,7 +624,7 @@ public class TestResourceTrackerService {
     dispatcher.await();
     Assert.assertTrue(NodeAction.NORMAL.equals(response.getNodeAction()));
     Assert.assertEquals(5120 + 10240, metrics.getAvailableMB());
-    
+
     // reconnect of node with changed capability and running applications
     List<ApplicationId> runningApps = new ArrayList<ApplicationId>();
     runningApps.add(ApplicationId.newInstance(1, 0));
@@ -631,6 +634,20 @@ public class TestResourceTrackerService {
     dispatcher.await();
     Assert.assertTrue(NodeAction.NORMAL.equals(response.getNodeAction()));
     Assert.assertEquals(5120 + 15360, metrics.getAvailableMB());
+    
+    // reconnect healthy node changing http port
+    nm1 = new MockNM("host1:1234", 5120, rm.getResourceTrackerService());
+    nm1.setHttpPort(3);
+    nm1.registerNode();
+    dispatcher.await();
+    response = nm1.nodeHeartbeat(true);
+    response = nm1.nodeHeartbeat(true);
+    dispatcher.await();
+    RMNode rmNode = rm.getRMContext().getRMNodes().get(nm1.getNodeId());
+    Assert.assertEquals(3, rmNode.getHttpPort());
+    Assert.assertEquals(5120, rmNode.getTotalCapability().getMemory());
+    Assert.assertEquals(5120 + 15360, metrics.getAvailableMB());
+
   }
 
   private void writeToHostsFile(String... hosts) throws IOException {

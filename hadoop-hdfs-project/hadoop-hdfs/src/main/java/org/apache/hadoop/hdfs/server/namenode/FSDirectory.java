@@ -89,8 +89,8 @@ import org.apache.hadoop.hdfs.server.namenode.snapshot.DirectorySnapshottableFea
 import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot;
 import org.apache.hadoop.hdfs.server.namenode.snapshot.Snapshot.Root;
 import org.apache.hadoop.hdfs.util.ByteArray;
-import org.apache.hadoop.hdfs.util.ChunkedArrayList;
 import org.apache.hadoop.hdfs.util.ReadOnlyList;
+import org.apache.hadoop.util.ChunkedArrayList;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
@@ -565,6 +565,10 @@ public class FSDirectory implements Closeable {
             + "failed to rename " + src + " to " + dst
             + " because the source can not be removed");
         return false;
+      } else {
+        INode srcChild = srcIIP.getLastINode();
+        // update the quota count if necessary
+        updateCountForDelete(srcChild, srcIIP);
       }
 
       added = tx.addSourceToDestination();
@@ -689,6 +693,10 @@ public class FSDirectory implements Closeable {
       NameNode.stateChangeLog.warn("DIR* FSDirectory.unprotectedRenameTo: "
           + error);
       throw new IOException(error);
+    } else {
+      INode srcChild = srcIIP.getLastINode();
+      // update the quota count if necessary
+      updateCountForDelete(srcChild, srcIIP);
     }
     
     boolean undoRemoveDst = false;
@@ -698,6 +706,8 @@ public class FSDirectory implements Closeable {
       if (dstInode != null) { // dst exists remove it
         if ((removedNum = removeLastINode(dstIIP)) != -1) {
           removedDst = dstIIP.getLastINode();
+          // update the quota count if necessary
+          updateCountForDelete(removedDst, dstIIP);
           undoRemoveDst = true;
         }
       }
@@ -724,8 +734,8 @@ public class FSDirectory implements Closeable {
               filesDeleted = true;
             } else {
               filesDeleted = removedDst.cleanSubtree(Snapshot.CURRENT_STATE_ID,
-                  dstIIP.getLatestSnapshotId(), collectedBlocks, removedINodes,
-                  true).get(Quota.NAMESPACE) >= 0;
+                  dstIIP.getLatestSnapshotId(), collectedBlocks, removedINodes)
+                  .get(Quota.NAMESPACE) >= 0;
             }
             getFSNamesystem().removePathAndBlocks(src, null, 
                 removedINodes, false);
@@ -1324,7 +1334,7 @@ public class FSDirectory implements Closeable {
    * @return the number of inodes deleted; 0 if no inodes are deleted.
    */ 
   long unprotectedDelete(INodesInPath iip, BlocksMapUpdateInfo collectedBlocks,
-      List<INode> removedINodes, long mtime) throws QuotaExceededException {
+      List<INode> removedINodes, long mtime) {
     assert hasWriteLock();
 
     // check if target node exists
@@ -1346,20 +1356,23 @@ public class FSDirectory implements Closeable {
     // set the parent's modification time
     final INodeDirectory parent = targetNode.getParent();
     parent.updateModificationTime(mtime, latestSnapshot);
+
+    updateCountForDelete(targetNode, iip);
     if (removed == 0) {
       return 0;
     }
     
-    // collect block
+    // collect block and update quota
     if (!targetNode.isInLatestSnapshot(latestSnapshot)) {
       targetNode.destroyAndCollectBlocks(collectedBlocks, removedINodes);
     } else {
       Quota.Counts counts = targetNode.cleanSubtree(Snapshot.CURRENT_STATE_ID,
-          latestSnapshot, collectedBlocks, removedINodes, true);
-      parent.addSpaceConsumed(-counts.get(Quota.NAMESPACE),
-          -counts.get(Quota.DISKSPACE), true);
+          latestSnapshot, collectedBlocks, removedINodes);
       removed = counts.get(Quota.NAMESPACE);
+      updateCountNoQuotaCheck(iip, iip.length() - 1,
+          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
     }
+
     if (NameNode.stateChangeLog.isDebugEnabled()) {
       NameNode.stateChangeLog.debug("DIR* FSDirectory.unprotectedDelete: "
           + targetNode.getFullPathName() + " is removed");
@@ -1701,7 +1714,21 @@ public class FSDirectory implements Closeable {
       writeUnlock();
     }
   }
-  
+
+  /**
+   * Update the quota usage after deletion. The quota update is only necessary
+   * when image/edits have been loaded and the file/dir to be deleted is not
+   * contained in snapshots.
+   */
+  void updateCountForDelete(final INode inode, final INodesInPath iip) {
+    if (getFSNamesystem().isImageLoaded() &&
+        !inode.isInLatestSnapshot(iip.getLatestSnapshotId())) {
+      Quota.Counts counts = inode.computeQuotaUsage();
+      unprotectedUpdateCount(iip, iip.length() - 1,
+          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
+    }
+  }
+ 
   private void updateCount(INodesInPath iip, long nsDelta, long dsDelta,
       boolean checkQuota) throws QuotaExceededException {
     updateCount(iip, iip.getINodes().length - 1, nsDelta, dsDelta, checkQuota);
@@ -1738,7 +1765,7 @@ public class FSDirectory implements Closeable {
    * update quota of each inode and check to see if quota is exceeded. 
    * See {@link #updateCount(INodesInPath, long, long, boolean)}
    */ 
-  private void updateCountNoQuotaCheck(INodesInPath inodesInPath,
+  void updateCountNoQuotaCheck(INodesInPath inodesInPath,
       int numOfINodes, long nsDelta, long dsDelta) {
     assert hasWriteLock();
     try {
@@ -2035,7 +2062,8 @@ public class FSDirectory implements Closeable {
    * The same as {@link #addChild(INodesInPath, int, INode, boolean)}
    * with pos = length - 1.
    */
-  private boolean addLastINode(INodesInPath inodesInPath,
+  @VisibleForTesting
+  public boolean addLastINode(INodesInPath inodesInPath,
       INode inode, boolean checkQuota) throws QuotaExceededException {
     final int pos = inodesInPath.getINodes().length - 1;
     return addChild(inodesInPath, pos, inode, checkQuota);
@@ -2111,33 +2139,25 @@ public class FSDirectory implements Closeable {
   
   /**
    * Remove the last inode in the path from the namespace.
+   * Note: the caller needs to update the ancestors' quota count.
+   *
    * Count of each ancestor with quota is also updated.
    * @return -1 for failing to remove;
    *          0 for removing a reference whose referred inode has other 
    *            reference nodes;
-   *         >0 otherwise. 
+   *          1 otherwise. 
    */
-  private long removeLastINode(final INodesInPath iip)
-      throws QuotaExceededException {
+  @VisibleForTesting
+  public long removeLastINode(final INodesInPath iip) {
     final int latestSnapshot = iip.getLatestSnapshotId();
     final INode last = iip.getLastINode();
     final INodeDirectory parent = iip.getINode(-2).asDirectory();
     if (!parent.removeChild(last, latestSnapshot)) {
       return -1;
     }
-    
-    if (!last.isInLatestSnapshot(latestSnapshot)) {
-      final Quota.Counts counts = last.computeQuotaUsage();
-      updateCountNoQuotaCheck(iip, iip.getINodes().length - 1,
-          -counts.get(Quota.NAMESPACE), -counts.get(Quota.DISKSPACE));
 
-      if (INodeReference.tryRemoveReference(last) > 0) {
-        return 0;
-      } else {
-        return counts.get(Quota.NAMESPACE);
-      }
-    }
-    return 1;
+    return (!last.isInLatestSnapshot(latestSnapshot)
+        && INodeReference.tryRemoveReference(last) > 0) ? 0 : 1;
   }
 
   static String normalizePath(String src) {
@@ -2643,13 +2663,14 @@ public class FSDirectory implements Closeable {
   List<AclEntry> setAcl(String src, List<AclEntry> aclSpec) throws IOException {
     writeLock();
     try {
-      return unprotectedSetAcl(src, aclSpec);
+      return unprotectedSetAcl(src, aclSpec, false);
     } finally {
       writeUnlock();
     }
   }
 
-  List<AclEntry> unprotectedSetAcl(String src, List<AclEntry> aclSpec)
+  List<AclEntry> unprotectedSetAcl(
+    String src, List<AclEntry> aclSpec, boolean fromEdits)
       throws IOException {
     // ACL removal is logged to edits as OP_SET_ACL with an empty list.
     if (aclSpec.isEmpty()) {
@@ -2661,9 +2682,11 @@ public class FSDirectory implements Closeable {
     INodesInPath iip = getINodesInPath4Write(normalizePath(src), true);
     INode inode = resolveLastINode(src, iip);
     int snapshotId = iip.getLatestSnapshotId();
-    List<AclEntry> existingAcl = AclStorage.readINodeLogicalAcl(inode);
-    List<AclEntry> newAcl = AclTransformation.replaceAclEntries(existingAcl,
-      aclSpec);
+    List<AclEntry> newAcl = aclSpec;
+    if (!fromEdits) {
+      List<AclEntry> existingAcl = AclStorage.readINodeLogicalAcl(inode);
+      newAcl = AclTransformation.replaceAclEntries(existingAcl, aclSpec);
+    }
     AclStorage.updateINodeAcl(inode, newAcl, snapshotId);
     return newAcl;
   }
