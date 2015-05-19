@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #include <sys/mount.h>
 #include <sys/wait.h>
+#include <sys/param.h>
+#include <sys/resource.h>
 
 static const int DEFAULT_MIN_USERID = 1000;
 
@@ -450,6 +452,7 @@ char *get_tmp_directory(const char *work_dir) {
  * Ensure that the given path and all of the parent directories are created
  * with the desired permissions.
  */
+/*
 int mkdirs(const char* path, mode_t perm) {
   struct stat sb;
   char * npath;
@@ -462,7 +465,7 @@ int mkdirs(const char* path, mode_t perm) {
     fprintf(LOGFILE, "Not enough memory to copy path string");
     return -1;
   }
-  /* Skip leading slashes. */
+  // Skip leading slashes. 
   p = npath;
   while (*p == '/') {
     p++;
@@ -474,12 +477,12 @@ int mkdirs(const char* path, mode_t perm) {
       free(npath);
       return -1;
     }
-    *p++ = '/'; /* restore slash */
+    *p++ = '/'; // restore slash 
     while (*p == '/')
       p++;
   }
 
-  /* Create the final directory component. */
+  // Create the final directory component. 
   if (create_validate_dir(npath, perm, path, 1) == -1) {
     free(npath);
     return -1;
@@ -494,6 +497,7 @@ int mkdirs(const char* path, mode_t perm) {
 * Give 0 or 1 to represent whether this is the final component. If it is, we
 * need to check the permission.
 */
+/*
 int create_validate_dir(char* npath, mode_t perm, char* path, int finalComponent) {
   struct stat sb;
   if (stat(npath, &sb) != 0) {
@@ -515,7 +519,8 @@ int create_validate_dir(char* npath, mode_t perm, char* path, int finalComponent
   }
   return 0;
 }
-
+*/
+/*
 // check whether the given path is a directory
 // also check the access permissions whether it is the same as desired permissions
 int check_dir(char* npath, mode_t st_mode, mode_t desired, int finalComponent) {
@@ -531,6 +536,32 @@ int check_dir(char* npath, mode_t st_mode, mode_t desired, int finalComponent) {
     }
   }
   return 0;
+}
+*/
+
+int mkdirs(const char* path, mode_t perm) {
+    struct stat sb;
+    if (stat(path, &sb) == 0) {
+        if (S_ISDIR (sb.st_mode)) {
+            return 0;
+        }else{
+            fprintf(LOGFILE, "Path %s is not an existed dir\n", path);
+	    return -1;
+      	}
+    }
+    else if (errno != ENOENT) {
+        fprintf(LOGFILE, "Can't access to directory %s - %s.\n", path, strerror(errno));
+      	return -1;
+    }
+    char npath[PATH_MAX];
+    memset(npath, 0x00, sizeof(npath));
+    strcpy(npath, path);
+    strcpy(npath, dirname(npath));
+
+    if(mkdirs(npath, perm) == 0 && mkdir(path, perm) == 0)
+  	return 0;
+    fprintf(LOGFILE, "Can't create directory %s - %s.\n", path, strerror(errno));
+    return -1;
 }
 
 /**
@@ -1441,7 +1472,11 @@ int mount_cgroup(const char *pair, const char *hierarchy) {
               pair);
     result = -1; 
   } else {
+#ifdef __APPLE__
+    if (mount("cgroup", mount_path, 0, controller) == 0) {
+#else
     if (mount("none", mount_path, "cgroup", 0, controller) == 0) {
+#endif
       char *buf = stpncpy(hier_path, mount_path, strlen(mount_path));
       *buf++ = '/';
       snprintf(buf, PATH_MAX - (buf - hier_path), "%s", hierarchy);
