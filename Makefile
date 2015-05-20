@@ -2,7 +2,7 @@ clean:
 	mvn clean
 
 compile:
-	mvn compile -Pnative -DskipTests
+	mvn compile -Pnative -DskipTests -X
 
 test:
 	mvn test -Pnative 
@@ -17,7 +17,7 @@ source:
 	mvn package -Psrc -DskipTests
 
 all:
-	mvn package install -Pdist,native,docs,src -DskipTests -Dtar
+	mvn package install -Pdist,native,docs,src -DskipTests -Dtar -X
 
 findbugs:
 	mvn compile findbugs:findbugs -DskipTests
